@@ -515,10 +515,18 @@ app URL, entirely independent of dev.
 `kubectl get pods` showing `Running` only proves the container started -
 it says nothing about whether the private networking path to Cloud SQL
 actually works. `scripts/test-db-connection.sh <dev|prod>` proves it does,
-using the app's own real config, not separate test credentials:
+using the app's own real config, not separate test credentials. The
+environment can be passed either as a positional argument or as the
+`ENV` environment variable - the positional argument wins if both are
+given:
 
 ```bash
 ./scripts/test-db-connection.sh dev
+# equivalent:
+ENV=dev ./scripts/test-db-connection.sh
+
+# handy for checking both in one go:
+for e in dev prod; do ENV="$e" ./scripts/test-db-connection.sh; done
 ```
 
 It reads `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER` straight off the live
@@ -748,9 +756,15 @@ authenticated with access to that environment's project;
 ```bash
 ./scripts/test-db-connection.sh dev
 ./scripts/test-db-connection.sh prod
+
+# equivalent, via env var instead of a positional argument:
+ENV=dev ./scripts/test-db-connection.sh
+ENV=prod ./scripts/test-db-connection.sh
 ```
 
-**Takes exactly one argument: `dev` or `prod`** - anything else prints
+**Takes the environment as either a positional argument or the `ENV`
+environment variable - `dev` or `prod`, one or the other required**
+(the positional argument wins if both are set); anything else prints
 usage and exits. Proves the private Pod -> VPC -> Private Service Access
 -> Cloud SQL path actually works, using the app's own real, live config
 (read directly off the Deployment and Secret in that environment's
@@ -773,6 +787,10 @@ way.
   proving the private path works, so it deliberately never tries to reach
   Cloud SQL from outside the VPC (that path doesn't exist - there's no
   public IP to even attempt it against).
+- If both the positional argument and `ENV` are set to conflicting
+  values, the positional argument silently wins - there's no warning,
+  since a script accepting two ways to say the same thing is expected to
+  pick a deterministic order, not fail.
 
 ### `teardown-dev.sh` / `teardown-prod.sh`
 

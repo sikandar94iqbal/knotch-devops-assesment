@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # test-db-connection.sh <dev|prod>
+#   or: ENV=<dev|prod> test-db-connection.sh
 #
 # Proves the private Pod -> VPC -> Private Service Access -> Cloud SQL path
 # actually works, end to end, from inside the cluster - not just "the
@@ -8,6 +9,12 @@
 # namespace as the app (so it takes the exact same network path a real
 # app Pod would), using the exact DB host/name/user/password the app
 # itself is configured with - no separate credentials, no assumptions.
+#
+# Which environment to test can be given either as a positional argument
+# or as the ENV environment variable (handy for CI or for scripting
+# against both environments in one loop, e.g.
+# `for e in dev prod; do ENV=$e ./scripts/test-db-connection.sh; done`).
+# The positional argument wins if both are set.
 #
 # Two checks:
 #   1. TCP reachability (pg_isready) - proves the private IP is routable
@@ -20,9 +27,10 @@
 
 set -euo pipefail
 
-ENV="${1:-}"
+ENV="${1:-${ENV:-}}"
 if [[ "$ENV" != "dev" && "$ENV" != "prod" ]]; then
   echo "Usage: $0 <dev|prod>"
+  echo "   or: ENV=<dev|prod> $0"
   exit 1
 fi
 

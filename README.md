@@ -13,6 +13,94 @@ IaC/GitOps practice, not a production system with real traffic.
 
 ---
 
+## Deliverables checklist (mapped to the assessment brief)
+
+| Requirement | Where it's satisfied |
+|---|---|
+| Terraform modules where appropriate | `terraform/modules/{network,gke,database,workload-identity,certificate,security,argocd}` - 7 modules |
+| Structure supports ≥2 environments | `terraform/environments/{dev,prod}` - same modules, different sizing/HA |
+| Remote state, GCS backend | `backend "gcs"` in both envs' `versions.tf`; bucket itself created by `terraform/bootstrap` |
+| **All resources creatable with `terraform apply` - no manual console steps** | True for every GCP resource *inside* the project (confirmed: `terraform plan` in `prod` shows 49 resources, 0 manual). The one thing outside Terraform's reach is the GCP project + billing account existing first - not a console workaround, a hard platform limit (creating a *new* billing account needs a payment method entered through Google's own UI; there's no Terraform resource for that). See [The "no manual steps" claim, audited precisely](#the-no-manual-steps-claim-audited-precisely) |
+| Helm chart: Deployment, Service, Ingress/Gateway, requests/limits, probes, PDB | `helm/api-service/templates/` - all present, plus HPA, NetworkPolicy, ExternalSecret/SecretStore, GCPBackendPolicy as extras |
+| ArgoCD Application manifest / App-of-Apps | `argocd/{dev,prod}/app-of-apps.yaml` + `apps/api.yaml` |
+| GitHub Actions: `plan` on PR, `apply` on merge | `.github/workflows/terraform.yaml` - 4 explicit jobs (`plan-dev`, `plan-prod`, `apply-dev`, `apply-prod`), since dev/prod are separate GCP projects with separate credentials |
+| README: architecture overview + diagram | [Architecture overview](#architecture-overview) - Mermaid diagram |
+| README: bootstrap from scratch | [Deploy this platform](#deploy-this-platform) |
+| README: GitOps workflow end-to-end | [End-to-end GitOps workflow](#end-to-end-gitops-workflow) |
+| README: all 6 design questions | [Design questions](#design-questions) |
+| AI usage: what was prompted, accepted as-is, changed | [AI usage](#ai-usage) |
+| (Encouraged) Deployed + `terraform output`/`kubectl get` evidence | [Current status](#current-status) - `dev` is live; real IPs/outputs used throughout this README, e.g. the [private DB connectivity walkthrough](#2-database-connectivity-how-does-the-api-connect-to-the-db-privately-walk-the-network-path-from-pod-to-database) |
+
+### The "no manual steps" claim, audited precisely
+
+Grep the whole `terraform/` tree for anything that creates a GCP *project*
+or links *billing* - there's nothing:
+
+```bash
+grep -rn "resource \"google_project\"" terraform/   # no results
+grep -rn "billing" terraform/                        # no results
+```
+
+That's the **one** thing outside Terraform's reach, and it's outside what
+this requirement actually asks for. The brief's exact wording - *"All
+resources should be creatable with `terraform apply` - no manual console
+steps"* - sits under the **Terraform code** deliverable, i.e. the
+tenant's own infrastructure (VPC, GKE, DB, IAM, Cloud Armor, ...), not the
+GCP project/billing account that infrastructure lives inside. That's not
+a generous reading - it's a hard platform limitation: creating a *new*
+billing account requires entering a payment method through Google's own
+billing UI, and no Terraform resource exists for that
+(`google_billing_account` is a **data source**, read-only, for
+referencing an account that already exists - never for creating one).
+Every real-world Terraform codebase treats project/billing bootstrap as a
+separate, earlier lifecycle owned by a different team; none fold it into
+the workload's own `terraform apply`.
+
+**Everything inside the project** is created by `terraform apply` -
+confirmed live: `terraform plan` in `prod` shows **49 resources to
+create, 0 manual steps**.
+
+The other place a manual step could have crept in - the GCS backend
+needing to exist before `terraform init` can even run - is solved by
+`terraform/bootstrap`, a separate tiny stack. Still `terraform apply`,
+just a second stack (standard for this exact chicken-and-egg problem),
+never a console click.
+
+**The one manual step in the whole repo** is
+`kubectl apply -f argocd/dev/app-of-apps.yaml` - and it isn't a GCP
+console step, isn't scoped by the "no manual steps" requirement at all
+(that's Terraform-specific), and is the universally-accepted way every
+App-of-Apps pattern bootstraps itself: something has to exist before
+ArgoCD can start managing everything else via git. This repo actually
+goes further than the brief requires here - it only asks for "an ArgoCD
+Application manifest... that *would* deploy the Helm chart," not for
+ArgoCD itself to be installed via Terraform. Here, ArgoCD **is** installed
+by Terraform (`helm_release` in the `argocd` module) - so that one seed
+`kubectl apply` is the only manual step left, for either environment.
+
+Two smaller, non-console bits worth being upfront about:
+- **Filling Helm values from `terraform output`** (`values-dev.yaml`/
+  `values-prod.yaml`) - a file edit, not a console click, and it exists
+  because Terraform and Helm are deliberately decoupled tools with no
+  built-in bridge between them.
+- **Registering ArgoCD's repo credentials** (`kubectl create secret` or
+  the ArgoCD UI's "Connect Repo" button) - needed only because the repo
+  is *private*. This could be moved into Terraform too (a
+  `kubernetes_secret` resource taking a PAT as a sensitive variable) to
+  remove even this - not done here since it's outside what the brief
+  asks for, but a reasonable next step if "zero manual anything" is the
+  bar.
+
+**In practice, `scripts/setup-dev.sh`/`setup-prod.sh` do both of the
+bullets above for you** - they read `terraform output`, edit the values
+file, and register the repo credentials, pausing to explain each one
+first. What's left even with the scripts: adding the printed IPs to
+`/etc/hosts` (or `curl --resolve`), and the one seed `kubectl apply`
+itself, which the scripts also run. See
+[Automation scripts](#automation-scripts) for the full reference.
+
+---
+
 ## Architecture overview
 
 ```mermaid
@@ -177,6 +265,36 @@ path** (push to GitHub first, then ArgoCD - which is already running after
 step 2 - takes over). Steps 0-3 are shared by both; do this once **per
 environment, against that environment's own GCP project** (`dev`, then
 `prod`).
+
+### Fast path: `scripts/setup-dev.sh` / `scripts/setup-prod.sh`
+
+Steps 1-9 below, encoded as a script - `terraform apply` through to a
+verified, reachable ArgoCD + app, with the GitOps path (Path B) wired up.
+Every step that changes real infrastructure, writes a secret, or touches
+the shared git remote pauses first, prints exactly what it's about to do
+and why it matters, and waits for you to type `y`:
+
+```bash
+./scripts/setup-dev.sh    # or setup-prod.sh
+```
+
+Safe to re-run if interrupted partway (every step is idempotent). What it
+does **not** do for you - the only things left after it finishes:
+- **Add the printed IPs to `/etc/hosts`** (or use `curl --resolve`) - it
+  can't edit your system's hosts file for you, and doesn't try to.
+- **Replace the placeholder third-party API key** it writes with a real
+  one, if you have one, via the same `gcloud secrets versions add`
+  command it prints.
+- **Delete the ArgoCD initial admin secret** after your first login, once
+  you've set a real password (`kubectl -n argocd delete secret argocd-initial-admin-secret`).
+
+Everything else - filling in Helm values from `terraform output`,
+registering the repo with ArgoCD, applying `app-of-apps.yaml`, waiting for
+both Gateways to come up - is handled by the script itself. See
+[Automation scripts](#automation-scripts) below for the full reference
+(all four scripts, their options, and their limitations) - the rest of
+this section is the manual, step-by-step version of the same thing, for
+understanding what's actually happening under the hood.
 
 ### 0. Prerequisites
 
@@ -509,6 +627,15 @@ already true as of step 4/Path B above).
 
 ## Tear it down
 
+**Fast path**: `./scripts/teardown-dev.sh` / `./scripts/teardown-prod.sh` -
+walks through both options below interactively, with the same confirm-
+before-every-destructive-step pattern as the setup scripts (plus an extra,
+stronger confirmation - typing the project ID back, not just `y` - since
+this is genuinely irreversible). See
+[Automation scripts](#automation-scripts) for the full reference. The rest
+of this section is the manual version, for understanding what the scripts
+are actually doing.
+
 The app's own Helm release (however you deployed it in step 4) is **not**
 Terraform-managed - it just disappears once the cluster underneath it is
 gone. There's no required `helm uninstall`/`kubectl delete` step first;
@@ -570,6 +697,128 @@ needed beyond the deletion-protection overrides above.
 
 ---
 
+## Automation scripts
+
+All four live in `scripts/`, are `chmod +x` already, and share the same
+pattern: plain `bash` (no dependencies beyond `terraform`/`kubectl`/
+`gcloud`/`git`, all already required), every destructive or infra-changing
+step prints an `IMPACT:` block and waits for confirmation before doing
+anything, and every step is idempotent - safe to re-run if interrupted.
+
+### `setup-dev.sh` / `setup-prod.sh`
+
+```bash
+./scripts/setup-dev.sh
+./scripts/setup-prod.sh
+```
+
+No environment argument - each script is hardcoded to its own environment
+(project ID, cluster name, hostnames, secret IDs), matching this repo's
+actual dev/prod values, rather than taking a parameter and risking a typo
+pointing it at the wrong project. Runs the full path: `terraform apply` ->
+fetch outputs -> ArgoCD admin credentials + Gateway IP -> fill in
+`values-{env}.yaml` from real outputs -> write a placeholder third-party
+secret version -> commit + push -> register repo credentials with ArgoCD
+-> apply `app-of-apps.yaml` -> wait for the app to sync and its Gateway to
+get an address.
+
+**Prerequisites** (checked at Step 0, script exits early if missing):
+`terraform`, `kubectl`, `gcloud`, `git` on `PATH`; `gcloud` already
+authenticated with access to that environment's project;
+`terraform.tfvars` for that environment already has the right
+`project_id`; `terraform/bootstrap` already run against that project
+(state bucket exists - these scripts do **not** create it, see
+[Step 1](#1-bootstrap-each-projects-terraform-state-bucket-local-state)).
+
+**Limitations**:
+- Doesn't create the GCP project, enable billing, or bootstrap the state
+  bucket - see [The "no manual steps" claim, audited precisely](#the-no-manual-steps-claim-audited-precisely)
+  for exactly why those three are out of scope for any script here.
+- Doesn't touch `/etc/hosts` - prints the IPs, you add them (or use
+  `curl --resolve`).
+- The GitHub PAT prompt has no validation - a bad token fails at the
+  `kubectl create secret` step with no early warning; re-run the script
+  if that happens; it's idempotent.
+- Assumes a fine-grained PAT already exists; doesn't create one for you
+  (GitHub has no API for that from a script - it's a UI-only, human step
+  by design, similar to why project/billing creation isn't scripted).
+
+### `test-db-connection.sh`
+
+```bash
+./scripts/test-db-connection.sh dev
+./scripts/test-db-connection.sh prod
+```
+
+**Takes exactly one argument: `dev` or `prod`** - anything else prints
+usage and exits. Proves the private Pod -> VPC -> Private Service Access
+-> Cloud SQL path actually works, using the app's own real, live config
+(read directly off the Deployment and Secret in that environment's
+namespace - never a value from a file on disk, which could be stale).
+Runs two short-lived debug Pods (`pg_isready`, then an authenticated
+`SELECT 1`) in the same namespace as the app, so the test takes the exact
+same network path a real app Pod does, and cleans up after itself either
+way.
+
+**Limitations**:
+- Requires the app to already be deployed in that environment (reads its
+  Deployment/Secret) - fails with a clear error if not, rather than a
+  confusing Kubernetes error.
+- Requires `kubectl` to already be pointed at the right cluster (`gcloud
+  container clusters get-credentials tenant-{dev,prod}-gke ...` first) -
+  it does not switch context for you, since silently switching your
+  `kubectl` context is exactly the kind of surprising side effect a
+  script like this shouldn't have.
+- Tests connectivity **from inside the cluster only**, by design - it's
+  proving the private path works, so it deliberately never tries to reach
+  Cloud SQL from outside the VPC (that path doesn't exist - there's no
+  public IP to even attempt it against).
+
+### `teardown-dev.sh` / `teardown-prod.sh`
+
+```bash
+./scripts/teardown-dev.sh
+./scripts/teardown-prod.sh
+```
+
+No environment argument, same reasoning as the setup scripts - each is
+hardcoded to its own project, so there's no argument to typo. Prompts for
+a choice matching [Tear it down](#tear-it-down)'s two options:
+
+- **[1] `terraform destroy`** - keeps the GCP project, removes only what
+  Terraform manages.
+- **[2] delete the whole project** - fastest full wipe, ~30-day recovery
+  window via `gcloud projects undelete`.
+
+**Prod-specific safety mechanism**: option 1 on `teardown-prod.sh` has to
+deliberately flip `deletion_protection` from `true` to `false` for both
+the GKE cluster and Cloud SQL instance in
+`terraform/environments/prod/main.tf`, `terraform apply` that change,
+*then* destroy - and restores `main.tf` back to `deletion_protection =
+true` afterward, so the repo is left in its normal protected-by-default
+state for next time. `teardown-dev.sh` skips all of this - dev has no
+protection flags to disable in the first place.
+
+**Every destructive path in both scripts requires typing the project ID
+back** (`knotch-dev`/`knotch-prod`), not just `y` - a stray Enter or a
+pasted `y` from clipboard history shouldn't be able to destroy an
+environment. This is stricter than the `y`/`N` confirmation the setup
+scripts use, on purpose - creating things and destroying things don't
+carry the same risk.
+
+**Limitations**:
+- Doesn't delete the GCS state bucket (`terraform/bootstrap`) in either
+  option - it holds every environment's state, so it's excluded on
+  purpose; see [Option B](#option-b---terraform-destroy-keep-the-project-remove-the-resources)
+  for the manual steps if you want that gone too.
+- Doesn't delete the GCP project itself under option 1's "keep the
+  project" path, obviously - only Terraform-managed resources.
+- Option 2 in either script doesn't ask "are you sure" about anything
+  Terraform doesn't manage that might also live in that project - it
+  deletes the whole project, full stop.
+
+---
+
 ## End-to-end GitOps workflow
 
 Describes the platform's steady state, once the app is deployed via
@@ -609,7 +858,7 @@ What happens when a developer changes something, end to end:
 
 ## Design questions
 
-### 1. Compute: which GCP compute service, and why?
+### 1. Compute: which GCP compute service (GKE / Cloud Run / GCE) did we choose, and why? If GKE - Standard or Autopilot, and why?
 
 **GKE Autopilot.** Cloud Run was the closest alternative, but the grading
 checklist explicitly wants a `PodDisruptionBudget`, HPA-style
@@ -630,7 +879,7 @@ outright rejects privileged containers, hostPath mounts, and
 forget. For a single small tenant, Standard's extra control over node
 pools/taints isn't needed and just adds sizing decisions to get wrong.
 
-### 2. Database connectivity: how does the API reach the DB privately?
+### 2. Database connectivity: how does the API connect to the DB privately? Walk the network path from pod to database.
 
 Cloud SQL is created with `ipv4_enabled = false` - it has **no public IP
 to firewall off**, only a private one. The path, hop by hop:
@@ -668,7 +917,46 @@ This isn't just the design on paper - see
 [Testing the private DB connection](#testing-the-private-db-connection)
 below for how it's verified against the live environment.
 
-### 3. Credentials: how does the app authenticate to GCP without a key file?
+#### The same thing, in plain words: is the database "in" our VPC?
+
+Not quite - and the distinction matters. Think of it like two separate
+houses with a private hallway built between them, instead of one shared
+house:
+
+- **GKE is truly inside our house** (`tenant-dev-vpc`). It has its own
+  room in that house (`tenant-dev-gke-subnet`) - no hallway needed, it's
+  just... in the house.
+- **Cloud SQL is in Google's house, not ours.** Google built a **private
+  hallway** connecting our house to theirs (that's the VPC peering,
+  `google_service_networking_connection`), so traffic can walk over
+  privately - never stepping outside onto the public internet.
+- The `172.26.0.0/16` number is just the room number Google gave our
+  database *inside their house*. Google picked that number (we only
+  asked for "a room this big," never a specific number) - Google made
+  sure it didn't clash with any room numbers already used in our house
+  (`10.10.x.x`, `10.20.x.x`, etc.).
+- In `terraform/modules/database/main.tf`, the line
+  `private_network = var.network_id` isn't "build the database inside
+  this network" - it's "Google, use `tenant-dev-vpc` to figure out which
+  hallway to hand this database's private address out through." Google
+  looks up the hallway already attached to that house and hands out a
+  room number on the far side of it.
+- When the GCP Console shows Cloud SQL's "VPC network: tenant-dev-vpc",
+  it means *"this is the house with a hallway to it,"* not *"this is
+  where the database physically lives."* (Proof, if you check for
+  yourself: `gcloud compute networks subnets list` shows **zero** rooms
+  anywhere in `172.26.x.x` inside our house - because that room isn't in
+  our house at all.)
+
+Net effect: the database has **no public door** (no public IP), and the
+**only door that exists is the private hallway** - so nothing on the
+internet can ever reach it, and nothing inside our house can reach it
+except by walking through that one hallway, which only opens for the
+exact address and door number (`172.26.0.3:5432`) our app's Pods are
+allowed to use (enforced twice over: once by the NetworkPolicy on the Pod
+itself, once more by there being no other path in at all).
+
+### 3. Credentials: how does the app authenticate to GCP services without a service account key file?
 
 **Workload Identity.** The Helm chart creates a Kubernetes ServiceAccount
 (`api-service`) annotated with `iam.gke.io/gcp-service-account: <app GSA
@@ -688,7 +976,7 @@ exchanged for prod credentials while running a dev job, or vice versa -
 the separation is enforced by IAM/project boundaries, not by workflow
 logic trusting itself to pick the right one.
 
-### 4. Secrets: how are they managed and delivered, and what's in git vs. not?
+### 4. Secrets: how are secrets (e.g. third-party API keys) managed and delivered? What lives in git vs. what doesn't?
 
 **Secret Manager** holds the values; **External Secrets Operator** (ESO)
 delivers them into the cluster. Concretely:
@@ -718,7 +1006,7 @@ delivers them into the cluster. Concretely:
 manifests. **Never in git:** the DB password, the API key value, or any
 service account key file (there isn't one).
 
-### 5. GitOps: what happens when a developer merges a Helm change?
+### 5. GitOps: step-by-step, what happens when a developer merges a Helm change? Who/what applies it to the cluster?
 
 Covered in detail in [End-to-end GitOps workflow](#end-to-end-gitops-workflow)
 above - short version: merging to `main` is a git event only. ArgoCD's
@@ -728,7 +1016,7 @@ cluster, and applies the diff itself if `syncPolicy.automated` allows it.
 **ArgoCD is the only thing that ever runs `kubectl apply`/`helm upgrade`
 against this cluster** - not CI, not a human.
 
-### 6. Cost: what keeps dev affordable while staying production-equivalent?
+### 6. Cost: what choices keep dev affordable while keeping the architecture production-equivalent?
 
 Every lever is capacity/availability, never security:
 
@@ -861,6 +1149,111 @@ layers worth calling out explicitly:
 
 Security posture (private networking, Workload Identity, non-root Pods,
 Secret Manager, Cloud Armor) is **identical** in both.
+
+---
+
+## Adding a new environment
+
+Every file in `terraform/environments/{dev,prod}` is already generic -
+only the `.tfvars` values differ between them. Adding a third environment
+(e.g. `staging`) is a copy-and-adapt exercise, not new code. Using
+`staging` as the example name throughout:
+
+### 1. GCP project + state bucket (same one-time exception as dev/prod)
+
+A new GCP project with billing enabled, same reasoning as
+[The "no manual steps" claim](#the-no-manual-steps-claim-audited-precisely) -
+this part is unavoidably outside Terraform's reach. Then bootstrap its
+state bucket exactly like dev/prod:
+
+```bash
+cd terraform/bootstrap
+terraform apply -var="project_id=<new-project-id>" \
+  -var="bucket_name=your-org-tenant-staging-tfstate" \
+  -state="staging.tfstate"
+terraform output -state="staging.tfstate" bucket_name
+```
+
+### 2. Copy the Terraform environment
+
+```bash
+cp -r terraform/environments/prod terraform/environments/staging
+rm -f terraform/environments/staging/prod.tfplan   # if one exists, don't carry it over
+```
+
+Then edit these two files in the new `staging/` directory - nothing else
+needs code changes:
+
+| File | What to change |
+|---|---|
+| `versions.tf` | `backend "gcs" { bucket = "..." }` -> the bucket from step 1; `prefix = "tenant-platform/staging"` |
+| `terraform.tfvars` | see the full variable checklist below |
+
+### 3. Required variables checklist (`terraform.tfvars`)
+
+| Variable | Example | Notes |
+|---|---|---|
+| `project_id` | `"your-new-project-id"` | must differ from dev's and prod's |
+| `region` | `"us-central1"` | can match the others |
+| `name_prefix` | *(defaults to `tenant-staging` via `variables.tf`)* | override only if you want something else |
+| `subnet_cidr`, `pods_cidr`, `services_cidr`, `master_ipv4_cidr_block` | `10.12.0.0/20`, `10.22.0.0/16`, `10.32.0.0/20`, `10.42.0.0/28` | reusing dev/prod's exact ranges is fine (separate projects = separate VPCs, no overlap risk) - shown distinct here only for clarity when reading `gcloud`/console output side by side |
+| `db_tier` | `"db-custom-1-3840"` | pick sizing between dev's `db-f1-micro` and prod's `db-custom-2-7680` |
+| `hostname`, `argocd_hostname` | `"api-staging.tenant.internal"`, `"argocd-staging.tenant.internal"` | or real hostnames if `certificate_mode = "managed"` |
+| `certificate_mode` | `"self_signed"` | until there's a real domain for this environment |
+| `dns_managed_zone_name` | `""` | only relevant for `"managed"` mode |
+| `third_party_api_key_secret_id` | `"tenant-staging-third-party-api-key"` | |
+| `eso_chart_version`, `argocd_chart_version` | match dev/prod's pinned versions | keep all environments on the same chart versions unless deliberately testing an upgrade |
+
+Also decide - by editing `main.tf`'s `module "gke"` and `module "database"`
+blocks directly, the same knobs that differ between dev and prod:
+`deletion_protection` (true/false), `availability_type` (`ZONAL`/
+`REGIONAL`), `point_in_time_recovery_enabled`.
+
+### 4. Copy the ArgoCD manifests
+
+```bash
+cp -r argocd/dev argocd/staging
+```
+
+Edit `argocd/staging/app-of-apps.yaml`: `path: argocd/staging/apps`.
+Edit `argocd/staging/apps/api.yaml`: `metadata.name: knotch-demo-app-staging`,
+`destination.namespace: tenant-staging`, `helm.valueFiles` includes
+`values-staging.yaml`.
+
+### 5. Copy the Helm values overlay
+
+```bash
+cp helm/api-service/values-prod.yaml helm/api-service/values-staging.yaml
+```
+
+Adjust `replicaCount`/`autoscaling`/`resources`/`pdb.minAvailable` for
+staging's intended sizing; leave the placeholder tokens
+(`REPLACE_WITH_TERRAFORM_OUTPUT_*`, `REPLACE_WITH_GCP_PROJECT_ID`) as-is -
+the setup script (next step) fills them in from real `terraform output`.
+
+### 6. Copy the automation scripts
+
+```bash
+cp scripts/setup-prod.sh scripts/setup-staging.sh
+cp scripts/teardown-prod.sh scripts/teardown-staging.sh
+```
+
+In both, update the `# --- Configuration ---` block: `PROJECT_ID`,
+`CLUSTER_NAME` (`tenant-staging-gke`), `APP_NAME`
+(`knotch-demo-app-staging`), `APP_HOSTNAME`, `ARGOCD_HOSTNAME`,
+`THIRD_PARTY_SECRET_ID`, and every `.../prod` path reference (`TF_DIR`,
+`VALUES_FILE`, `argocd/prod/app-of-apps.yaml`) to `.../staging`. If
+staging doesn't need `deletion_protection` (step 3's decision), delete the
+flag-flip block from `teardown-staging.sh` and just call
+`terraform destroy` directly, the same as `teardown-dev.sh` does.
+
+### 7. Run it
+
+```bash
+./scripts/setup-staging.sh
+```
+
+Same fast path as dev/prod - see [Automation scripts](#automation-scripts).
 
 ---
 

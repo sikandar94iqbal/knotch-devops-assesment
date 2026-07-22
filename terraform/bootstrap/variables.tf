@@ -13,3 +13,9 @@ variable "bucket_name" {
   description = "Name of the GCS bucket that will hold every environment's Terraform state. Must be globally unique across all of GCP."
   type        = string
 }
+
+variable "noncurrent_version_retention_days" {
+  description = "How long a superseded (noncurrent) state version stays recoverable before GCS deletes it. Bounds the audit trail instead of letting versioned state grow forever; the current/live state version is never affected."
+  type        = number
+  default     = 30
+}

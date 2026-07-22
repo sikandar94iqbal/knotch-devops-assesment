@@ -132,13 +132,30 @@ way the first attempt was.
 │   └── environments/
 │       ├── dev/                # cheap sizing; wires modules; installs ESO + ArgoCD via helm_release; GCS backend
 │       └── prod/                # HA/PITR/protected sizing; same modules
-├── helm/api-service/           # Deployment, Service, Gateway, HPA, PDB, ExternalSecret, SecretStore, GCPBackendPolicy
+├── helm/api-service/           # Deployment, Service, Gateway, HPA, PDB, NetworkPolicy, ExternalSecret, SecretStore, GCPBackendPolicy
 ├── argocd/
 │   ├── dev/                    # app-of-apps.yaml + apps/api.yaml - dev cluster's ArgoCD only
 │   └── prod/                   # app-of-apps.yaml + apps/api.yaml - prod cluster's ArgoCD only
+├── scripts/
+│   ├── setup-prod.sh           # provisions prod end-to-end, confirms impact before every change
+│   └── test-db-connection.sh   # proves the private Pod -> VPC -> Cloud SQL path actually works
 ├── .github/workflows/          # terraform.yaml - plan on PR, apply on merge
 └── docs/architecture.dot       # Graphviz source for the diagram above
 ```
+
+---
+
+## Current status
+
+| Environment | Infrastructure | ArgoCD | App |
+|---|---|---|---|
+| **dev** (`knotch-dev` project) | Applied - VPC, GKE Autopilot, Cloud SQL, Cloud Armor, Certificate Manager | Live at `https://argocd-dev.tenant.internal/`, repo connected | `knotch-demo-app-dev` deployed via ArgoCD from this repo's `main`, live at `https://api-dev.tenant.internal/`, verified reachable end-to-end (Gateway -> Cloud Armor -> Service -> Pod), private DB path verified with `scripts/test-db-connection.sh dev` |
+| **prod** (`knotch-prod` project) | Not yet applied - `scripts/setup-prod.sh` is ready to run | - | - |
+
+Both projects have billing enabled and their Terraform state buckets
+bootstrapped already (`knotch-dev-tfstate`, `knotch-prod-tfstate`). Running
+`scripts/setup-prod.sh` walks through the rest of prod, confirming the
+impact of each step before it happens.
 
 ---
 
@@ -292,7 +309,7 @@ the `terraform output` values above.
 ```bash
 kubectl create namespace tenant-dev
 
-helm install api-dev helm/api-service \
+helm install knotch-demo-app-dev helm/api-service \
   -n tenant-dev \
   -f helm/api-service/values.yaml \
   -f helm/api-service/values-dev.yaml
@@ -318,9 +335,10 @@ kubectl apply -f argocd/dev/app-of-apps.yaml
 
 This is the **only manual `kubectl apply` this platform ever needs.**
 ArgoCD (already logged into in step 3) picks up `argocd/dev/apps/api.yaml`
-within seconds, renders `helm/api-service`, and creates the release itself
-- watch it happen live in the ArgoCD UI. If you did Path A first, delete
-that release (`helm uninstall api-dev -n tenant-dev`) before doing Path B,
+within seconds, creates a `knotch-demo-app-dev` Application, renders
+`helm/api-service`, and creates the release itself - watch it happen live
+in the ArgoCD UI. If you did Path A first, delete that release
+(`helm uninstall knotch-demo-app-dev -n tenant-dev`) before doing Path B,
 so ArgoCD isn't fighting a release it doesn't own.
 
 ### 5. Verify it's actually running
@@ -333,14 +351,18 @@ Wait for the Pods to go `Running` and `1/1 Ready` (readiness probe passing)
 and the `Gateway` to report an address:
 
 ```bash
-kubectl get gateway api-dev -n tenant-dev -o jsonpath='{.status.addresses[0].value}'
+kubectl get gateway knotch-demo-app-dev-api-service -n tenant-dev -o jsonpath='{.status.addresses[0].value}'
 ```
+
+(The Gateway/Service/Deployment name is `<helm-release-name>-api-service` -
+`knotch-demo-app-dev-api-service` for this release, per the chart's
+`fullname` helper.)
 
 With the default self-signed setup, that IP isn't attached to a real
 domain, so point your own resolver at it to test the real HTTPS path:
 
 ```bash
-GATEWAY_IP="$(kubectl get gateway api-dev -n tenant-dev -o jsonpath='{.status.addresses[0].value}')"
+GATEWAY_IP="$(kubectl get gateway knotch-demo-app-dev-api-service -n tenant-dev -o jsonpath='{.status.addresses[0].value}')"
 
 # Option A: one-off, no /etc/hosts edit
 curl -k --resolve api-dev.tenant.internal:443:$GATEWAY_IP https://api-dev.tenant.internal/
@@ -355,16 +377,48 @@ here - the cert is self-signed on purpose because no domain is registered
 yet. A 200 response with nginx's welcome page confirms the entire path end
 to end: Gateway -> Cloud Armor -> Service -> Pod. If you'd rather skip the
 Gateway/TLS entirely for a first smoke test, `kubectl port-forward` also
-works: `kubectl port-forward -n tenant-dev svc/api-dev-api-service 8080:80`.
+works: `kubectl port-forward -n tenant-dev svc/knotch-demo-app-dev-api-service 8080:80`.
 
 To confirm secrets actually made it into the Pod (rather than just
 "Running"): `kubectl exec` in and check the env vars, or
-`kubectl get secret api-dev-api-service-secrets -n tenant-dev -o yaml`.
+`kubectl get secret knotch-demo-app-dev-api-service-secrets -n tenant-dev -o yaml`.
+Prove the DB path itself works end to end (not just "the Pod started") with
+`scripts/test-db-connection.sh dev` - see
+[Testing the private DB connection](#testing-the-private-db-connection)
+below.
 
 Repeat steps 2-5 for `terraform/environments/prod` when you're ready for a
 second environment - it gets its own cluster, its own ArgoCD instance and
 URL (`terraform output argocd_url` in the `prod` directory), and its own
 app URL, entirely independent of dev.
+
+### Testing the private DB connection
+
+`kubectl get pods` showing `Running` only proves the container started -
+it says nothing about whether the private networking path to Cloud SQL
+actually works. `scripts/test-db-connection.sh <dev|prod>` proves it does,
+using the app's own real config, not separate test credentials:
+
+```bash
+./scripts/test-db-connection.sh dev
+```
+
+It reads `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER` straight off the live
+Deployment and the password straight off the Secret ESO synced from
+Secret Manager, then runs two checks from a short-lived debug Pod in the
+same namespace (so it takes the exact same network path a real app Pod
+does), cleaning up after itself either way:
+
+1. **`pg_isready`** - TCP-level reachability, proving the private IP is
+   actually routable from inside the VPC, independent of credentials.
+2. **`psql -c "SELECT 1"`** - an authenticated query, proving the
+   password ESO delivered is correct and Cloud SQL accepts the connection
+   over TLS.
+
+Confirmed against the live dev environment: `pg_isready` returned
+`172.26.0.3:5432 - accepting connections`, and the query returned `1` -
+the full Pod -> VPC -> Private Service Access -> Cloud SQL path, working
+end to end with the real, ESO-delivered credentials.
 
 ### Later: turning on CI (`terraform plan`/`apply` via GitHub Actions)
 
@@ -536,8 +590,8 @@ What happens when a developer changes something, end to end:
    Environment manual-approval rule.
 2. **App/Helm change** (anything under `helm/api-service/`, e.g. bumping
    `replicaCount` or `image.tag`): open a PR, get it reviewed, merge to
-   `main`. **No CI step touches the cluster.** ArgoCD's `api-dev` /
-   `api-prod` `Application` polls the repo, notices the new commit on its
+   `main`. **No CI step touches the cluster.** ArgoCD's `knotch-demo-app-dev` /
+   `knotch-demo-app-prod` `Application` polls the repo, notices the new commit on its
    tracked `path`, renders the chart with `values.yaml` + the
    environment's override file, and diffs the result against live cluster
    state. If `syncPolicy.automated` is satisfied, it applies the diff
@@ -581,17 +635,38 @@ pools/taints isn't needed and just adds sizing decisions to get wrong.
 Cloud SQL is created with `ipv4_enabled = false` - it has **no public IP
 to firewall off**, only a private one. The path, hop by hop:
 
-`API Pod` (IP from the GKE Pods secondary range) -> egresses via the VPC's
-regional routing -> **Private Service Access** VPC peering
-(`google_service_networking_connection`, backed by a reserved
-`google_compute_global_address` range) connecting our VPC to Google's
-service-producer network -> **Cloud SQL's private IP**, which lives in
-that peered range. `ssl_mode = ENCRYPTED_ONLY` requires TLS on top of
-that (without demanding a client certificate, since the app authenticates
-with a DB password, not mTLS). Traffic never leaves Google's network and never
-touches Cloud NAT or the public internet - Cloud NAT exists only for node
-*egress to the internet* (image pulls), which is a completely separate
-path from the DB connection.
+1. **API Pod** gets its IP from the GKE cluster's Pods secondary range
+   (`10.20.0.0/16` in dev, `10.21.0.0/16` in prod - a distinct range from
+   node IPs and Service ClusterIPs, per the VPC-native/alias-IP design GKE
+   requires).
+2. The Pod's outbound connection to `DB_HOST` (the Cloud SQL private IP,
+   injected as a plain env var - see design question 4 for why this one
+   isn't a secret) is evaluated against the app's own **NetworkPolicy**
+   first: egress to that exact `/32` on port 5432 is explicitly allowed;
+   everything not explicitly allowed is denied by default once any
+   NetworkPolicy selects the Pod (GKE Autopilot always runs Dataplane
+   V2/Cilium, so this enforces with no extra setup).
+3. Traffic leaves the Pod and routes through the VPC's regional routing to
+   the **Private Service Access** peering
+   (`google_service_networking_connection`, backed by a reserved
+   `google_compute_global_address` range - `tenant-{env}-psa-range`)
+   connecting this VPC to Google's service-producer network.
+4. It arrives at **Cloud SQL's private IP**, which lives inside that
+   peered range (confirmed live in dev: `172.26.0.3`, inside the
+   `tenant-dev-psa-range` block).
+5. `ssl_mode = ENCRYPTED_ONLY` requires TLS on top of all of this
+   (without demanding a client certificate, since the app authenticates
+   with a DB password, not mTLS).
+
+Traffic never leaves Google's network and never touches Cloud NAT or the
+public internet - Cloud NAT exists only for node *egress to the internet*
+(image pulls), which is a completely separate path from the DB connection.
+No firewall rule makes this private - the instance simply has no public
+IP to route to, and PSA's peering is the only path in.
+
+This isn't just the design on paper - see
+[Testing the private DB connection](#testing-the-private-db-connection)
+below for how it's verified against the live environment.
 
 ### 3. Credentials: how does the app authenticate to GCP without a key file?
 
@@ -696,6 +771,75 @@ Every lever is capacity/availability, never security:
   non-root containers, Cloud Armor) are **Terraform/Kubernetes config, not
   paid add-ons** - dev gets the identical security posture as prod for
   free; only capacity and HA cost money, and only prod pays for it.
+
+---
+
+## Security, scalability & reliability hardening
+
+Beyond the core architecture above, a few defense-in-depth and resilience
+layers worth calling out explicitly:
+
+### Security
+
+- **Firewall rules are port-scoped, not "all TCP"**: the VPC firewall rule
+  that lets Google Front End (GFE) reach backend Pods
+  (`terraform/modules/network`) only opens the exact ports those backends
+  serve on (`8080`, via `var.backend_ports`) from GFE's two well-known
+  ranges - not every port from those ranges, and nothing from anywhere
+  else.
+- **NetworkPolicy on every app Pod** (`helm/api-service/templates/networkpolicy.yaml`),
+  enforced by GKE Autopilot's always-on Dataplane V2/Cilium, no extra
+  setup required:
+  - **Ingress**: only GFE's ranges, only on the container's port. Nothing
+    else in the cluster - not even another namespace - can reach the Pod
+    directly. Cloud Armor and this NetworkPolicy are two independent
+    layers enforcing the same "only through the Gateway" rule; either one
+    failing doesn't remove the other.
+  - **Egress**: DNS (needed for any resolution at all), the exact Cloud
+    SQL private IP on port 5432 only (not the whole VPC or Cloud SQL's
+    entire IP space), and HTTPS/443 broadly for whatever external/GCP API
+    calls a real app might make. Nothing else is reachable from the Pod.
+  - Kubelet's own readiness/liveness probes originate node-locally and
+    are unaffected by either policy.
+- **State bucket hardening** (`terraform/bootstrap`): `public_access_prevention = "enforced"`
+  as a second, explicit guard on top of uniform bucket-level access, and a
+  `lifecycle_rule` that expires noncurrent (superseded) state versions
+  after 30 days - bounds the audit trail instead of letting versioned
+  state grow forever, without ever touching the live/current version.
+  State **locking** needed no new config at all: Terraform's `gcs` backend
+  always uses this bucket's atomic, generation-conditional writes to lock
+  state during an apply - unlike backends that need a separate lock table,
+  there's nothing to turn on.
+
+### Scalability
+
+- **HPA scales on CPU *and* memory** (`helm/api-service/templates/hpa.yaml`),
+  not CPU alone - whichever resource is under more pressure drives the
+  scale-out decision.
+- **Asymmetric scaling behavior**: scale-up has a `0s` stabilization
+  window (react to a traffic spike immediately), scale-down has a `300s`
+  window and removes at most one Pod per 2 minutes - prevents flapping
+  (scale down, immediately scale back up) at the cost of a few minutes of
+  slightly-over-provisioned capacity right after a spike passes.
+- GKE **Autopilot** scales the underlying compute automatically to fit
+  whatever the HPA asks for - there's no node pool to separately size or
+  autoscale.
+
+### Reliability
+
+- **`topologySpreadConstraints`** on the Deployment spread replicas across
+  zones (`maxSkew: 1`, soft/`ScheduleAnyway` so it never blocks scheduling
+  if perfect balance isn't available) - a single zone outage doesn't take
+  every replica down at once.
+- **PodDisruptionBudget** guarantees a minimum number of replicas stay up
+  during voluntary disruptions (node drains, cluster upgrades) - Autopilot
+  upgrades nodes frequently.
+- **Cloud SQL**: `REGIONAL` availability (synchronous standby, automatic
+  failover) + point-in-time recovery in prod; `ZONAL` in dev, where an
+  outage is acceptable and HA cost isn't justified.
+- **Two fully independent GCP projects**: an incident, quota exhaustion,
+  or misconfiguration in dev has no path to affect prod - not just
+  separate resources, a separate blast-radius boundary.
 
 ---
 
@@ -807,9 +951,34 @@ recorded in `CLAUDE.md`.
   lint`/`helm template` (with both `values-dev.yaml` and
   `values-prod.yaml`) were run to confirm every chart -
   `GCPBackendPolicy` included - renders valid Kubernetes manifests before
-  this was called done. The actual live deployment (`terraform apply`
-  against real GCP projects) was run by the repo owner, not by the
-  assistant, using their own GCP credentials.
+  this was called done.
+- **Sixth pass, hardening + a rename, applied against the live dev
+  environment**: renamed the app's ArgoCD Application/Helm release
+  (`api-dev`/`api-prod` -> `knotch-demo-app-dev`/`knotch-demo-app-prod`),
+  added a `NetworkPolicy` (ingress scoped to GFE's ranges, egress scoped
+  to DNS + the exact Cloud SQL IP + HTTPS), scoped the GFE firewall rule
+  to the actual serving port instead of all TCP ports, added
+  `topologySpreadConstraints` and asymmetric HPA scale-up/scale-down
+  behavior, and hardened the state bucket (`public_access_prevention`,
+  noncurrent-version lifecycle cleanup). Wrote and then **ran** two
+  scripts against the real dev cluster to verify, rather than assuming
+  correctness from the code alone: `scripts/test-db-connection.sh`
+  (`pg_isready` + an authenticated `SELECT 1`, both passed using the
+  exact ESO-delivered credentials) and confirmed the NetworkPolicy/
+  firewall changes didn't break the already-working Gateway/Cloud
+  Armor/ArgoCD path. `scripts/setup-prod.sh` was written but deliberately
+  *not* run by the assistant - the repo owner asked to run prod
+  themselves and drive that one interactively.
+- Correcting the record on who ran what: earlier in this session, the
+  assistant *did* directly execute a number of `gcloud`/`kubectl`/`helm`
+  commands against the live `knotch-dev` project (via a terminal the
+  assistant had access to) - including the original `terraform apply`,
+  diagnosing and fixing the Cloud Armor WAF/ArgoCD login issue, and the
+  DB connectivity tests above - not purely "written by AI, applied by a
+  human" as an earlier draft of this section implied. Every one of those
+  actions is traceable in this repo's conversation history and this
+  README's own changelog-style entries above; nothing was applied
+  silently or without the repo owner present and confirming each step.
 
 ---
 
@@ -828,19 +997,17 @@ recorded in `CLAUDE.md`.
 
 - [x] `terraform fmt -check` clean; `terraform validate` passes for bootstrap and both envs (seven modules: network, gke, database, workload-identity, certificate, security, argocd)
 - [x] `helm lint` passes; `helm template` renders valid Kubernetes objects for dev and prod values
-- [x] All required Helm objects present (Deployment, Service, Gateway/HTTPRoute, requests/limits, probes, PDB, HPA, ServiceAccount, ExternalSecret, SecretStore, GCPBackendPolicy/Cloud Armor)
-- [x] ArgoCD app-of-apps + child app present per environment (`argocd/dev/`, `argocd/prod/`), installed by Terraform - just needs `REPLACE_ORG/REPLACE_REPO` + `kubectl apply` once the repo is on GitHub
+- [x] All required Helm objects present (Deployment, Service, Gateway/HTTPRoute, requests/limits, probes, PDB, HPA, NetworkPolicy, ServiceAccount, ExternalSecret, SecretStore, GCPBackendPolicy/Cloud Armor)
+- [x] ArgoCD app-of-apps + child app present per environment (`argocd/dev/`, `argocd/prod/`), installed by Terraform
 - [x] GitHub Actions workflow: plan on PR, apply on merge, keyless via WIF (optional - only needed if you want CI running Terraform too; ArgoCD deploying the app doesn't depend on it)
 - [x] `terraform apply` in `dev`/`prod` alone provisions the entire environment, including cluster add-ons (ESO, ArgoCD) and TLS cert(s) - only the one-time `terraform/bootstrap` stack (creates the state bucket itself) runs separately, for the unavoidable chicken-and-egg reason explained there
 - [x] Can run without a registered domain (`certificate_mode = "self_signed"`) and still serve real HTTPS end-to-end
 - [x] Every public-facing endpoint - the app and ArgoCD alike - is reachable only through a GKE Gateway (GLB) with the same Cloud Armor policy attached; neither has its own raw `LoadBalancer` Service
 - [x] dev and prod are fully separate GCP projects - separate state buckets, separate CI service accounts/WIF providers, no shared IAM or quota
+- [x] State bucket hardened: explicit `public_access_prevention`, noncurrent-version lifecycle cleanup, and versioning/locking confirmed built into the `gcs` backend by default
+- [x] Firewall + NetworkPolicy scoped to exact ports/destinations, not broad allows - see [Security, scalability & reliability hardening](#security-scalability--reliability-hardening)
+- [x] Private DB connectivity verified against the live environment, not just asserted - `scripts/test-db-connection.sh`, see [Testing the private DB connection](#testing-the-private-db-connection)
 - [x] README complete with diagram, bootstrap, GitOps flow, all 6 design answers, AI-usage section
-- [ ] Placeholders replaced with real values for your GCP project/GitHub repo
-- [ ] (Bonus) Deployed to a free-tier GCP project with `terraform output` / `kubectl get` screenshots below
-
-### Screenshots (bonus)
-
-_Not deployed to a live GCP project for this submission - add
-`terraform output` / `kubectl get pods,gateway,externalsecret` screenshots
-here if you deploy it._
+- [x] Placeholders replaced with real values - `knotch-dev`/`knotch-prod` projects, real repo pushed to GitHub
+- [x] (Bonus) **dev** deployed to a real GCP project end to end: infra, ArgoCD, and the app itself all live and verified reachable - see [Current status](#current-status)
+- [ ] (Bonus) **prod** deployed - `scripts/setup-prod.sh` is ready; not yet run

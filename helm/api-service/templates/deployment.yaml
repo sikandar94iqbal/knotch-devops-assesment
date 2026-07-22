@@ -19,6 +19,17 @@ spec:
       serviceAccountName: {{ include "api-service.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Spreads replicas across zones so a single zone outage doesn't take
+      # every replica down at once - a soft constraint (ScheduleAnyway),
+      # so it never blocks scheduling if perfect balance isn't available,
+      # it just prefers it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "api-service.selectorLabels" . | nindent 14 }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

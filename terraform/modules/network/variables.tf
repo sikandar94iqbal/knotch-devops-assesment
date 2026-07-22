@@ -33,3 +33,9 @@ variable "private_service_access_cidr_prefix_length" {
   type        = number
   default     = 16
 }
+
+variable "backend_ports" {
+  description = "TCP ports the GFE health-check/LB firewall rule allows through - only the ports backend Services actually listen on, not every port."
+  type        = list(string)
+  default     = ["8080"]
+}

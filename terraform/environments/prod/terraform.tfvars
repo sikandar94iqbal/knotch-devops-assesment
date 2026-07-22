@@ -5,12 +5,18 @@
 project_id = "knotch-prod"
 region     = "us-central1"
 
-# Hostname the Gateway serves and the managed TLS cert covers.
-hostname = "REPLACE_WITH_HOSTNAME.example.com"
-
-# ArgoCD's own hostname - separate Gateway/cert from the app's, but same
-# managed-cert/Cloud Armor treatment. Never a separate public LoadBalancer.
-argocd_hostname = "REPLACE_WITH_ARGOCD_HOSTNAME.example.com"
+# No real domain registered yet: certificate_mode = "self_signed" makes
+# Terraform generate and upload a self-signed cert for these hostnames, so
+# both Gateways serve real HTTPS without any DNS validation. Neither
+# hostname needs to resolve anywhere public - map each to its Gateway's IP
+# in /etc/hosts (or use `curl --resolve`) to test, same as dev.
+#
+# Once you have a real domain: change these to real hostnames, flip
+# certificate_mode to "managed", and re-`apply` - the cert map entries
+# just start pointing at real, DNS-validated certificates instead.
+hostname         = "api-prod.tenant.internal"
+argocd_hostname  = "argocd-prod.tenant.internal"
+certificate_mode = "self_signed"
 
 # If this domain's zone lives in Cloud DNS in this project, set its managed
 # zone name here to auto-create the certificate's DNS authorization record.

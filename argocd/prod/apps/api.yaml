@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: api-prod
+  name: knotch-demo-app-prod
   namespace: argocd
   finalizers:
     - resources-finalizer.argocd.argoproj.io

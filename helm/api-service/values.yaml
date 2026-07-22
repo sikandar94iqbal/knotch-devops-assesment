@@ -54,6 +54,7 @@ autoscaling:
   minReplicas: 2
   maxReplicas: 4
   targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
 
 pdb:
   # Guarantees at least this many Pods stay up during voluntary disruptions

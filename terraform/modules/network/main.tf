@@ -103,7 +103,9 @@ resource "google_compute_router_nat" "nat" {
 # Google Front End (GFE) health checkers and load balancer proxies live in
 # these two well-known ranges. The Gateway API's managed load balancer needs
 # to reach Pod backends through them, so we allow ingress from just these
-# ranges rather than opening the subnet broadly.
+# ranges - scoped further to only the ports our backends actually serve on
+# (8080, for both the app and ArgoCD's --insecure server), not every TCP
+# port.
 resource "google_compute_firewall" "allow_lb_health_checks" {
   project       = var.project_id
   name          = "${var.name_prefix}-allow-gfe-health-checks"
@@ -113,5 +115,6 @@ resource "google_compute_firewall" "allow_lb_health_checks" {
 
   allow {
     protocol = "tcp"
+    ports    = var.backend_ports
   }
 }

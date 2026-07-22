@@ -1,0 +1,64 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "api-service.fullname" . }}
+  labels:
+    {{- include "api-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "api-service.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only Google Front End (the Gateway's health checkers and LB proxies)
+    # can reach this Pod directly - defense in depth on top of Cloud
+    # Armor/the VPC firewall, enforced at the Pod network layer itself
+    # (GKE Autopilot always runs Dataplane V2/Cilium, so NetworkPolicy is
+    # available with no extra setup). Kubelet's own readiness/liveness
+    # probes originate node-locally and are unaffected by this policy.
+    - from:
+        - ipBlock:
+            cidr: 130.211.0.0/22
+        - ipBlock:
+            cidr: 35.191.0.0/16
+      ports:
+        - protocol: TCP
+          port: {{ .Values.service.targetPort }}
+  egress:
+    # DNS - needed for any name resolution at all.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.database.host }}
+    # Cloud SQL - only this exact private IP, only the Postgres port. Not
+    # "the whole VPC" or "all of Cloud SQL's IP space" - just the one
+    # instance this app actually talks to.
+    - to:
+        - ipBlock:
+            cidr: "{{ .Values.database.host }}/32"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.database.port }}
+    {{- end }}
+    # HTTPS egress for whatever external/GCP API calls the app itself
+    # makes (e.g. a real backend calling a third-party API using the
+    # secret ExternalSecret delivers) - scoped to port 443 only, not left
+    # fully open on every port. ESO's own Secret Manager calls happen from
+    # ESO's Pod in a different namespace, not from here.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443

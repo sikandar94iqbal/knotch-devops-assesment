@@ -18,3 +18,28 @@ spec:
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+  behavior:
+    # Scale up fast - a traffic spike shouldn't wait around before adding
+    # capacity.
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    # Scale down slowly - a brief dip in load shouldn't immediately shed
+    # replicas only to scale back up a minute later. Reduces flapping at
+    # the cost of a few minutes of slightly-over-provisioned capacity
+    # after a spike passes.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

@@ -25,8 +25,34 @@ resource "google_storage_bucket" "tf_state" {
 
   uniform_bucket_level_access = true
 
+  # Belt-and-suspenders on top of uniform_bucket_level_access - don't rely
+  # on org policy inheritance alone to keep this bucket off the public
+  # internet, since it holds every environment's Terraform state.
+  public_access_prevention = "enforced"
+
+  # State LOCKING itself needs no separate config: Terraform's "gcs"
+  # backend always uses this bucket's atomic, generation-conditional
+  # writes to lock state during an apply - unlike some other backends,
+  # there's no lock table/flag to turn on. Versioning below is what makes
+  # every past state readable/recoverable, which is the "trace" half of
+  # the ask - locking and history are two different mechanisms, both
+  # already covered by a plain GCS backend.
   versioning {
     enabled = true
+  }
+
+  # Keeps the audit trail bounded: old state versions stay recoverable for
+  # 30 days, then age out automatically instead of growing forever. The
+  # live (current) state version is never touched by this rule - it only
+  # ever acts on noncurrent (superseded) versions.
+  lifecycle_rule {
+    condition {
+      num_newer_versions         = 3
+      days_since_noncurrent_time = var.noncurrent_version_retention_days
+    }
+    action {
+      type = "Delete"
+    }
   }
 
   # This bucket holds every environment's Terraform state - losing it is

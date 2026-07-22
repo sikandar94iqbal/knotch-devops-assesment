@@ -1,0 +1,65 @@
+{{- $secretName := printf "%s-gateway-tls-placeholder" (include "api-service.fullname" .) }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
+---
+# Gateway API's core schema requires at least one entry in
+# `certificateRefs` when a listener's TLS mode is Terminate - but GKE
+# actually serves TLS from the Certificate Manager map referenced by the
+# `networking.gke.io/certmap` annotation below, and ignores this Secret's
+# contents entirely. This placeholder exists purely to satisfy that schema
+# requirement; do not read anything security-relevant into it. Reused
+# across upgrades via `lookup` so it doesn't churn on every deploy.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels:
+    {{- include "api-service.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  {{- if $existing }}
+  tls.crt: {{ index $existing.data "tls.crt" }}
+  tls.key: {{ index $existing.data "tls.key" }}
+  {{- else }}
+  {{- $cert := genSelfSignedCert .Values.gateway.hostname nil (list .Values.gateway.hostname) 3650 }}
+  tls.crt: {{ $cert.Cert | b64enc }}
+  tls.key: {{ $cert.Key | b64enc }}
+  {{- end }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ include "api-service.fullname" . }}
+  labels:
+    {{- include "api-service.labels" . | nindent 4 }}
+  annotations:
+    # Points the managed HTTPS listener at a Certificate Manager certificate
+    # map holding the Google-managed TLS cert for `gateway.hostname`. This
+    # is what actually serves TLS - the certificateRefs Secret above is
+    # just schema filler, not the real cert.
+    networking.gke.io/certmap: {{ .Values.gateway.certificateMapName | quote }}
+spec:
+  # gke-l7-global-external-managed provisions a global external Application
+  # Load Balancer with a public IP - this is the one and only inbound path
+  # into the whole platform.
+  gatewayClassName: {{ .Values.gateway.className }}
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: {{ .Values.gateway.hostname | quote }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: {{ $secretName }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: http
+      # Kept only to serve the HTTP->HTTPS redirect below; it never
+      # forwards plaintext traffic to a Pod.
+      protocol: HTTP
+      port: 80
+      hostname: {{ .Values.gateway.hostname | quote }}
+      allowedRoutes:
+        namespaces:
+          from: Same

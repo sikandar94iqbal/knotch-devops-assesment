@@ -1,0 +1,33 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: argocd-https
+spec:
+  parentRefs:
+    - name: argocd-gateway
+      sectionName: https
+  hostnames:
+    - {{ .Values.hostname | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ .Values.serviceName }}
+          port: {{ .Values.servicePort }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: argocd-http-redirect
+spec:
+  parentRefs:
+    - name: argocd-gateway
+      sectionName: http
+  hostnames:
+    - {{ .Values.hostname | quote }}
+  rules:
+    # Every plaintext request gets redirected to HTTPS - same rule as the
+    # app's Gateway; ArgoCD never serves the admin UI unencrypted.
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

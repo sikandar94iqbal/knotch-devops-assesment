@@ -1,0 +1,48 @@
+# Overrides layered on top of values.yaml for the dev environment.
+# Non-placeholder values below (project ID, cluster name, DB host, SA
+# email) are filled in from `terraform output` after `terraform apply` in
+# terraform/environments/dev - see the README bootstrap section.
+
+replicaCount: 2
+
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# Matches terraform/environments/dev/terraform.tfvars: no real domain
+# registered yet, so this hostname doesn't need to resolve publicly - map
+# it to the Gateway's external IP in /etc/hosts (or `curl --resolve`) to
+# test. Swap for a real domain + "managed" certificate_mode once you have
+# one; both this value and certMapName only need updating here, nothing
+# else in the chart changes.
+gateway:
+  hostname: "api-dev.tenant.internal"
+  certificateMapName: "tenant-dev-certmap"
+
+cloudArmor:
+  securityPolicyName: "tenant-dev-armor-policy"
+
+serviceAccount:
+  gcpServiceAccountEmail: "tenant-dev-app-sa@knotch-dev.iam.gserviceaccount.com"
+
+database:
+  host: "172.26.0.3"
+  name: appdb
+  user: appuser
+
+externalSecrets:
+  gcpProjectId: "knotch-dev"
+  gcpRegion: us-central1
+  clusterName: "tenant-dev-gke"
+  dbPasswordSecretId: "tenant-dev-db-password"
+  thirdPartyApiKeySecretId: "tenant-dev-third-party-api-key"
+  refreshInterval: 1m

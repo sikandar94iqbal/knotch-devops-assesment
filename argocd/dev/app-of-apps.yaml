@@ -1,0 +1,31 @@
+# App-of-Apps root for the DEV cluster's own ArgoCD instance. Applied once,
+# by hand, to the dev cluster only (see README bootstrap) - everything
+# after this point is managed by ArgoCD reading git, never by a person
+# running kubectl/helm directly.
+#
+# Points ONLY at argocd/dev/apps/ - this cluster's ArgoCD never sees prod's
+# Application manifests, because dev and prod are separate GKE clusters
+# with entirely separate ArgoCD installs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    # REPLACE_ORG/REPLACE_REPO: this repo's own git URL.
+    repoURL: https://github.com/REPLACE_ORG/REPLACE_REPO.git
+    targetRevision: main
+    path: argocd/dev/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,846 @@
+# Multi-Tenant Backend API Platform on GCP
+
+A GitOps-driven, Terraform-provisioned platform for onboarding a new tenant's
+backend API service onto a shared GCP SaaS environment. This is a take-home
+assessment deliverable: a portfolio artifact demonstrating architecture and
+IaC/GitOps practice, not a production system with real traffic.
+
+> **Scenario:** a SaaS company runs a multi-tenant platform on GCP. We're
+> onboarding a new tenant's backend API. It must be reachable over HTTPS,
+> talk to a fully private database, be reproducible via Terraform, deploy
+> only through GitOps, and reflect production-grade security even though
+> it's sized for a dev budget.
+
+---
+
+## Architecture overview
+
+```mermaid
+flowchart LR
+    customer([Customer<br/>HTTPS]) -->|443| glb[App Gateway<br/>GLB + Cloud Armor +<br/>TLS cert]
+    admin([Operator<br/>HTTPS]) -->|443| aglb[ArgoCD Gateway<br/>GLB + Cloud Armor +<br/>TLS cert]
+
+    subgraph project["GCP Project: dev (prod is a separate,<br/>identical project - own IAM, own quotas)"]
+        subgraph vpc["VPC (private, custom-mode)"]
+            subgraph gke["GKE Autopilot cluster (private nodes)"]
+                pod[API Pod<br/>nginx-unprivileged<br/>non-root, RO rootfs]
+                eso[External Secrets<br/>Operator]
+                argocd[ArgoCD server<br/>ClusterIP only -<br/>no public IP of its own]
+            end
+            nat[Cloud NAT<br/>egress only]
+            sql[(Cloud SQL Postgres<br/>private IP only)]
+        end
+
+        sm[Secret Manager<br/>DB password + API key]
+    end
+
+    glb -->|health-checked HTTP| pod
+    aglb -->|health-checked HTTP| argocd
+    pod -->|private IP via<br/>VPC peering| sql
+    pod -.->|image pulls| nat
+    eso -->|Workload Identity<br/>no key files| sm
+    eso -->|writes K8s Secret| pod
+
+    subgraph git["Git / CI"]
+        repo[(GitHub repo)]
+        actions[GitHub Actions<br/>plan on PR, apply on merge<br/>keyless via per-project WIF]
+    end
+
+    repo -->|PR / merge| actions
+    actions -.->|terraform apply, WIF| sql
+    actions -.->|terraform apply, WIF| glb
+    repo -->|git pull, Helm chart| argocd
+    argocd -->|sync, no manual kubectl| pod
+```
+
+**Every public-facing endpoint - the app and ArgoCD alike - sits behind its
+own Global external HTTPS Load Balancer (GKE Gateway API) with the same
+Cloud Armor policy attached.** Nothing gets a raw `LoadBalancer` Service of
+its own; `argocd-server` is `ClusterIP`-only and reachable exclusively
+through its Gateway, same as the app's Pods.
+
+Everything inside the "GCP Project: dev" box is created by one
+`terraform apply` (see [Deploy this platform](#deploy-this-platform) below)
+- prod is the exact same set of resources, in a second, entirely separate
+GCP project (its own project ID, its own state bucket, its own CI service
+account). The "Git / CI" box on the right is the steady-state GitOps loop
+that takes over *after* this repo is pushed to GitHub.
+
+A Graphviz source for the same diagram lives at
+[docs/architecture.dot](docs/architecture.dot) (`dot -Tsvg architecture.dot -o architecture.svg`).
+
+### Components
+
+| Layer | Choice | Why (short version - full reasoning in [Design questions](#design-questions)) |
+|---|---|---|
+| Project isolation | **Separate GCP project per environment** | dev and prod get their own IAM, quotas, and billing - not just separate VPCs in a shared project. A misconfigured role binding or runaway resource in dev has no path to prod, structurally |
+| Compute | GKE **Autopilot** | No node management, pay-per-Pod, secure defaults enforced (Workload Identity, Shielded Nodes, no privileged Pods) |
+| Database | Cloud SQL **PostgreSQL**, `ipv4_enabled = false` | Private-only by construction, not by firewall rule |
+| Private DB path | **Private Service Access** (VPC peering) | Pod -> VPC -> peering -> Cloud SQL private IP, never touches the internet |
+| Ingress | **GKE Gateway API** + Google-managed TLS | Modern managed HTTPS LB, terminates TLS at the edge, cert provisioned by Terraform via Certificate Manager; **every** public endpoint (app + ArgoCD) gets its own Gateway - nothing uses a raw `LoadBalancer` Service |
+| Edge security | **Cloud Armor** (rate limit + adaptive L7 DDoS defense) | Attached to every backend Service via `GCPBackendPolicy` - the app and ArgoCD share the same policy, so the admin UI isn't a weaker exception. Preconfigured WAF rulesets were tried and pulled - see [Known limitation: no WAF rulesets](#known-limitation-no-waf-rulesets-yet) |
+| Pod credentials | **Workload Identity** | Pods impersonate a GCP SA - zero key files |
+| Secrets | **Secret Manager** + **External Secrets Operator** | Values live in Secret Manager; only references live in git; refreshed every 1m; ESO itself is installed by Terraform (`helm_release`) in the same `apply` that creates the cluster |
+| IaC | **Terraform**, modular, GCS remote backend, 2 projects/environments | Reproducible, collaborative, locked state per project; a single `terraform apply` creates the entire environment, add-ons included |
+| GitOps | **ArgoCD** App-of-Apps, auto-sync + self-heal | Git is the only source of truth; no manual `kubectl`; ArgoCD itself is installed by Terraform (`helm_release`), `ClusterIP`-only, exposed through its own Gateway + Cloud Armor - one independent instance per project/environment |
+| CI | **GitHub Actions**, keyless (Workload Identity Federation) | Plan on PR, apply on merge, no SA key stored as a secret; separate WIF provider + CI service account per GCP project |
+| Egress | **Cloud NAT** | Private nodes still reach the internet for image pulls |
+
+### Known limitation: no WAF rulesets (yet)
+
+Found and fixed against a real deployment, not caught by any local
+validation: Google's preconfigured Cloud Armor WAF rulesets
+(`sqli-stable`, `xss-stable`) were originally attached to the shared
+security policy at `deny(403)`. They blocked ArgoCD's **own** login
+redirect - `GET /login?return_url=https%3A%2F%2Fargocd-dev.tenant.internal%2Fapplications`
+- because a URL-encoded absolute URL inside a query parameter is a
+textbook false-positive trigger for these rulesets at default strictness.
+The symptom looked like a broken password; it was actually the page load
+itself being denied before any credential check happened.
+
+**Current state**: both WAF rules have been removed from
+`terraform/modules/security/main.tf` (and from the live policy - the
+`security_policy` resource in Terraform will now match reality on the
+next `apply`). What's still active: adaptive Layer 7 DDoS defense and the
+per-IP rate limit. What's gone: signature-based SQLi/XSS blocking.
+
+**If you want WAF protection back**, the right fix is *not* re-adding the
+same blanket rules - it's scoping them with
+[`preconfiguredWafConfig` exclusions](https://cloud.google.com/armor/docs/waf-rules#tuning_rules_to_avoid_false_positives)
+for the specific paths/parameters that legitimately carry redirect-style
+URLs (ArgoCD's `return_url`, and potentially the app's own OAuth-style
+callback params if it grows any), validated against real traffic in
+`preview: true` mode before switching to enforce - not applied blind the
+way the first attempt was.
+
+---
+
+## Repository layout
+
+```
+.
+├── terraform/
+│   ├── bootstrap/               # one-time: creates the GCS state bucket (local state, chicken-and-egg)
+│   ├── modules/
+│   │   ├── network/            # VPC, subnet, Private Service Access, Cloud NAT
+│   │   ├── gke/                # GKE Autopilot, private, Workload Identity, Gateway API
+│   │   ├── database/           # Cloud SQL Postgres (private IP) + Secret Manager
+│   │   ├── workload-identity/  # GCP SAs + IAM bindings (app + ESO)
+│   │   ├── certificate/        # Certificate Manager - managed or self-signed TLS cert + cert map
+│   │   ├── security/           # Cloud Armor rate-limit + adaptive DDoS policy (no WAF rulesets - see README)
+│   │   └── argocd/             # ArgoCD via helm_release (ClusterIP) + its own Gateway/GCPBackendPolicy chart
+│   └── environments/
+│       ├── dev/                # cheap sizing; wires modules; installs ESO + ArgoCD via helm_release; GCS backend
+│       └── prod/                # HA/PITR/protected sizing; same modules
+├── helm/api-service/           # Deployment, Service, Gateway, HPA, PDB, ExternalSecret, SecretStore, GCPBackendPolicy
+├── argocd/
+│   ├── dev/                    # app-of-apps.yaml + apps/api.yaml - dev cluster's ArgoCD only
+│   └── prod/                   # app-of-apps.yaml + apps/api.yaml - prod cluster's ArgoCD only
+├── .github/workflows/          # terraform.yaml - plan on PR, apply on merge
+└── docs/architecture.dot       # Graphviz source for the diagram above
+```
+
+---
+
+## Deploy this platform
+
+**Yes, `terraform apply` sets up everything** in one shot: networking, the
+private GKE cluster with Gateway API on, Cloud SQL, Secret Manager,
+Workload Identity, the Cloud Armor policy, a TLS certificate, **and** two
+cluster add-ons - External Secrets Operator and **ArgoCD, with its own
+externally-reachable URL** - all installed by that same `apply`, no
+separate `helm install` for any of it. The one thing Terraform can't hand
+you a URL for is the *app itself*, because Gateway API IPs and ArgoCD's
+Application sync both only exist once something is actually deployed - see
+steps 3-4 below for that, and step 5 for where to find both URLs.
+
+Two paths for step 4 (deploying the app): a **quick path** (`helm install`
+directly - works immediately, no GitHub needed) and the **full GitOps
+path** (push to GitHub first, then ArgoCD - which is already running after
+step 2 - takes over). Steps 0-3 are shared by both; do this once **per
+environment, against that environment's own GCP project** (`dev`, then
+`prod`).
+
+### 0. Prerequisites
+
+- **Two** GCP projects with billing enabled - one for dev, one for prod.
+  Separate projects, not separate VPCs in one project: dev's IAM, quotas,
+  and blast radius stay fully isolated from prod's. `gcloud` already
+  authenticated (`gcloud auth login`) with access to both.
+- `terraform` (>= 1.5), `helm`, `kubectl` installed locally.
+- A domain you control is **not required to get started** - see
+  `certificate_mode = "self_signed"` below. Only needed for a real,
+  browser-trusted certificate later.
+
+### 1. Bootstrap each project's Terraform state bucket (local state)
+
+The **only** thing that genuinely can't be created by `terraform apply` in
+step 2: the GCS bucket each environment uses *as its own Terraform
+backend*. A `backend "gcs"` block needs the bucket to already exist before
+`terraform init` will even run, so this lives in its own tiny stack
+(`terraform/bootstrap`) with local state instead of a GCS backend - the
+one Terraform config in this repo NOT run through the GCS-backend pattern,
+for exactly that chicken-and-egg reason.
+
+Run it **twice** - once per project, each producing its own bucket in its
+own project (no bucket is shared between dev and prod, matching the
+"separate projects" isolation goal all the way down to state storage):
+
+```bash
+cd terraform/bootstrap
+terraform init
+
+# --- dev project ---
+export DEV_PROJECT_ID="your-dev-gcp-project-id"
+terraform apply -var="project_id=$DEV_PROJECT_ID" -var="bucket_name=your-org-tenant-dev-tfstate"
+terraform output bucket_name   # -> paste into terraform/environments/dev/versions.tf
+
+# --- prod project (separate terraform state for the bootstrap stack itself too) ---
+export PROD_PROJECT_ID="your-prod-gcp-project-id"
+terraform apply -var="project_id=$PROD_PROJECT_ID" -var="bucket_name=your-org-tenant-prod-tfstate" \
+  -state="prod.tfstate"
+terraform output -state="prod.tfstate" bucket_name   # -> paste into terraform/environments/prod/versions.tf
+
+cd ../..
+```
+
+`-state="prod.tfstate"` keeps the bootstrap stack's own two runs from
+overwriting each other's local state file (there's no backend here to do
+that automatically, since this stack creates the backend everything else
+uses). `bucket_name` must be globally unique across all of GCP, not just
+within your project.
+
+Paste each bucket name into `bucket = "REPLACE_WITH_{DEV,PROD}_TF_STATE_BUCKET"`
+in that environment's own `terraform/environments/{dev,prod}/versions.tf`,
+and set `project_id` in each environment's `terraform.tfvars` to that
+environment's project ID. `hostname` and `certificate_mode` in
+`terraform/environments/dev/terraform.tfvars` are already set up for the
+no-domain path (`api-dev.tenant.internal` / `self_signed`) - leave them
+as-is until you have a real domain.
+
+*(GitHub OIDC trust for CI is a separate, optional concern - see
+[Later: turning on CI](#later-turning-on-ci-terraform-planapply-via-github-actions)
+below. Neither this step nor ArgoCD deploying the app needs it.)*
+
+### 2. Provision the infrastructure
+
+```bash
+cd terraform/environments/dev
+terraform init
+terraform plan
+terraform apply
+```
+
+This single `apply` creates **everything**: project API enablement, VPC,
+GKE Autopilot cluster (with the Gateway API controller turned on), Cloud
+SQL, Secret Manager, Workload Identity bindings, the Cloud Armor security
+policy, the Certificate Manager certificate (self-signed - no DNS
+validation needed with the default `terraform.tfvars`), External Secrets
+Operator, and ArgoCD - the last two installed into the cluster via
+`helm_release`, ESO's controller ServiceAccount already annotated for
+Workload Identity. Nothing here needs a console click, and there's no
+separate `helm install` step for either cluster add-on to remember.
+
+Grab the outputs you'll need next:
+
+```bash
+terraform output
+gcloud container clusters get-credentials "$(terraform output -raw cluster_name)" --region us-central1
+```
+
+### 3. Log into ArgoCD (already running - no extra install step)
+
+ArgoCD is **not** exposed via its own LoadBalancer - `argocd-server` is
+`ClusterIP`-only, reachable exclusively through its own Gateway + the same
+Cloud Armor policy protecting the app (see the architecture diagram
+above). That means the URL is deterministic as soon as `apply` finishes
+(it's just the hostname you set, not a runtime-assigned IP), but you still
+need to point that hostname at the Gateway's actual IP, same as you do for
+the app:
+
+```bash
+terraform output argocd_url
+# -> https://argocd-dev.tenant.internal/ (deterministic, no waiting)
+
+eval "$(terraform output -raw argocd_gateway_ip_hint)"   # prints the kubectl command
+ARGOCD_GATEWAY_IP="$(kubectl get gateway argocd-gateway -n argocd -o jsonpath='{.status.addresses[0].value}')"
+
+eval "$(terraform output -raw argocd_admin_password_hint)"   # prints the admin password
+```
+
+Reach it with either approach (same as the app in step 5 below):
+
+```bash
+curl -k --resolve argocd-dev.tenant.internal:443:$ARGOCD_GATEWAY_IP https://argocd-dev.tenant.internal/
+# or add "$ARGOCD_GATEWAY_IP  argocd-dev.tenant.internal" to /etc/hosts and just browse to the URL
+```
+
+Log in as `admin` with the password from above. Your browser will warn
+about the certificate - self-signed on purpose, same story as the app's.
+Right now there's nothing for ArgoCD to manage yet (no Application has
+been created) - that's what step 4 does.
+
+### 4. Deploy the app
+
+Either path starts the same way: fill in the placeholders in
+`helm/api-service/values-dev.yaml` (`serviceAccount.gcpServiceAccountEmail`,
+`database.host`, `externalSecrets.*`, `cloudArmor.securityPolicyName`) from
+the `terraform output` values above.
+
+**Path A - quick (`helm install` directly, no GitHub needed):**
+
+```bash
+kubectl create namespace tenant-dev
+
+helm install api-dev helm/api-service \
+  -n tenant-dev \
+  -f helm/api-service/values.yaml \
+  -f helm/api-service/values-dev.yaml
+```
+
+A normal, imperative `helm install` - fine for getting the app running and
+verified right now. ArgoCD (already running since step 2) won't know about
+this release until you switch to Path B.
+
+**Path B - GitOps (ArgoCD deploys it, once this repo is on GitHub):**
+
+```bash
+git remote add origin https://github.com/REPLACE_ORG/REPLACE_REPO.git   # your real repo
+git push -u origin main
+```
+
+Replace `REPLACE_ORG/REPLACE_REPO` in `argocd/dev/app-of-apps.yaml` and
+`argocd/dev/apps/api.yaml` with that same repo, commit, push, then:
+
+```bash
+kubectl apply -f argocd/dev/app-of-apps.yaml
+```
+
+This is the **only manual `kubectl apply` this platform ever needs.**
+ArgoCD (already logged into in step 3) picks up `argocd/dev/apps/api.yaml`
+within seconds, renders `helm/api-service`, and creates the release itself
+- watch it happen live in the ArgoCD UI. If you did Path A first, delete
+that release (`helm uninstall api-dev -n tenant-dev`) before doing Path B,
+so ArgoCD isn't fighting a release it doesn't own.
+
+### 5. Verify it's actually running
+
+```bash
+kubectl get pods,svc,gateway,httproute,externalsecret,secretstore -n tenant-dev
+```
+
+Wait for the Pods to go `Running` and `1/1 Ready` (readiness probe passing)
+and the `Gateway` to report an address:
+
+```bash
+kubectl get gateway api-dev -n tenant-dev -o jsonpath='{.status.addresses[0].value}'
+```
+
+With the default self-signed setup, that IP isn't attached to a real
+domain, so point your own resolver at it to test the real HTTPS path:
+
+```bash
+GATEWAY_IP="$(kubectl get gateway api-dev -n tenant-dev -o jsonpath='{.status.addresses[0].value}')"
+
+# Option A: one-off, no /etc/hosts edit
+curl -k --resolve api-dev.tenant.internal:443:$GATEWAY_IP https://api-dev.tenant.internal/
+
+# Option B: add a line to /etc/hosts, then just curl/browse normally
+#   <GATEWAY_IP>  api-dev.tenant.internal
+curl -k https://api-dev.tenant.internal/
+```
+
+`-k` skips certificate trust verification, which is expected and correct
+here - the cert is self-signed on purpose because no domain is registered
+yet. A 200 response with nginx's welcome page confirms the entire path end
+to end: Gateway -> Cloud Armor -> Service -> Pod. If you'd rather skip the
+Gateway/TLS entirely for a first smoke test, `kubectl port-forward` also
+works: `kubectl port-forward -n tenant-dev svc/api-dev-api-service 8080:80`.
+
+To confirm secrets actually made it into the Pod (rather than just
+"Running"): `kubectl exec` in and check the env vars, or
+`kubectl get secret api-dev-api-service-secrets -n tenant-dev -o yaml`.
+
+Repeat steps 2-5 for `terraform/environments/prod` when you're ready for a
+second environment - it gets its own cluster, its own ArgoCD instance and
+URL (`terraform output argocd_url` in the `prod` directory), and its own
+app URL, entirely independent of dev.
+
+### Later: turning on CI (`terraform plan`/`apply` via GitHub Actions)
+
+ArgoCD deploying the *app* from git (Path B above) only needs this repo on
+GitHub - nothing else. This section is a separate, optional concern: having
+GitHub Actions run `terraform plan`/`apply` for *infrastructure* changes
+too, instead of you running them locally. Skip it if you're fine running
+`terraform apply` by hand for now.
+
+Because dev and prod are separate projects, CI needs a **separate WIF pool
+and service account per project** too - `.github/workflows/terraform.yaml`
+is written as explicit `plan-dev`/`plan-prod`/`apply-dev`/`apply-prod` jobs
+for exactly this reason (a single matrix job can't hold two different sets
+of credentials). Run this once per project:
+
+```bash
+export GITHUB_ORG="REPLACE_ORG"
+export GITHUB_REPO="REPLACE_REPO"
+
+# --- repeat this whole block once for dev, once for prod ---
+export PROJECT_ID="your-dev-or-prod-gcp-project-id"   # e.g. $DEV_PROJECT_ID, then $PROD_PROJECT_ID
+export ENV_NAME="dev"                                  # or "prod"
+
+# Workload Identity Federation pool + provider, trusting GitHub Actions'
+# OIDC tokens - this is what makes CI's GCP auth keyless. A separate pool
+# per project, since pools are project-scoped resources.
+gcloud iam workload-identity-pools create "github-pool" \
+  --project="$PROJECT_ID" --location="global"
+
+gcloud iam workload-identity-pools providers create-oidc "github-provider" \
+  --project="$PROJECT_ID" --location="global" \
+  --workload-identity-pool="github-pool" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
+  --attribute-condition="assertion.repository=='${GITHUB_ORG}/${GITHUB_REPO}'"
+
+# CI service account - scoped to exactly the IAM roles `terraform apply`
+# needs across the modules in this repo, nothing broader, and nothing
+# outside this one project.
+gcloud iam service-accounts create "tenant-platform-ci-${ENV_NAME}" \
+  --project "$PROJECT_ID" --display-name "GitHub Actions Terraform CI (${ENV_NAME})"
+
+for role in roles/container.admin roles/compute.networkAdmin \
+            roles/cloudsql.admin roles/secretmanager.admin \
+            roles/iam.serviceAccountAdmin roles/iam.workloadIdentityPoolAdmin \
+            roles/resourcemanager.projectIamAdmin roles/serviceusage.serviceUsageAdmin \
+            roles/certificatemanager.editor roles/dns.admin roles/compute.securityAdmin; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:tenant-platform-ci-${ENV_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --role="$role"
+done
+
+# Grant access to THIS project's own state bucket only (from step 1) -
+# never the other environment's bucket, which lives in the other project.
+gcloud storage buckets add-iam-policy-binding "gs://your-org-tenant-${ENV_NAME}-tfstate" \
+  --member="serviceAccount:tenant-platform-ci-${ENV_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+
+# Let GitHub's OIDC token impersonate this project's CI service account.
+gcloud iam service-accounts add-iam-policy-binding \
+  "tenant-platform-ci-${ENV_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/attribute.repository/${GITHUB_ORG}/${GITHUB_REPO}"
+```
+
+Then, in the GitHub repo (Settings -> Secrets and variables -> Actions ->
+Variables - these are identifiers, not secrets), set **all four** - the
+workflow reads these exact names:
+
+- `DEV_WORKLOAD_IDENTITY_PROVIDER` = `projects/DEV_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider`
+- `DEV_CI_SERVICE_ACCOUNT` = `tenant-platform-ci-dev@DEV_PROJECT_ID.iam.gserviceaccount.com`
+- `PROD_WORKLOAD_IDENTITY_PROVIDER` = `projects/PROD_PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/providers/github-provider`
+- `PROD_CI_SERVICE_ACCOUNT` = `tenant-platform-ci-prod@PROD_PROJECT_ID.iam.gserviceaccount.com`
+
+If you want prod applies gated behind manual approval, add required-
+reviewer protection rules to the "prod" GitHub Environment in repo
+Settings - `apply-prod` already declares `environment: prod` and `needs:
+apply-dev`, so it'll wait for both dev to finish and a reviewer to
+approve.
+
+From here, merges to `main` under `terraform/` run through the GitHub
+Actions workflow instead of a local `terraform apply` - see
+[End-to-end GitOps workflow](#end-to-end-gitops-workflow) for the full
+steady-state picture (infra changes via CI, app changes via ArgoCD,
+already true as of step 4/Path B above).
+
+---
+
+## Tear it down
+
+The app's own Helm release (however you deployed it in step 4) is **not**
+Terraform-managed - it just disappears once the cluster underneath it is
+gone. There's no required `helm uninstall`/`kubectl delete` step first;
+tearing down the environment's Terraform is enough on its own.
+
+### Option A - delete the whole GCP project (fastest full wipe)
+
+If a project only exists for this platform (true for most dev/test
+throwaways), deleting the project removes *everything* in one shot -
+cluster, database, secrets, network, state bucket - and bypasses every
+`deletion_protection`/`prevent_destroy` flag below, since those only guard
+direct resource-level delete calls, not project deletion:
+
+```bash
+gcloud projects delete "$DEV_PROJECT_ID"    # or $PROD_PROJECT_ID
+```
+
+GCP schedules the project (and everything in it) for deletion after a
+~30-day grace period, during which `gcloud projects undelete` can still
+recover it if this was a mistake.
+
+### Option B - `terraform destroy` (keep the project, remove the resources)
+
+Destroy **environments before bootstrap** - an environment's own Terraform
+state lives inside the bucket the bootstrap stack created, so removing
+that bucket first would stand up nothing to destroy against.
+
+```bash
+cd terraform/environments/dev   # or prod
+terraform destroy
+```
+
+Two safety nets will refuse a naive `terraform destroy` here, on purpose:
+
+- **Prod's GKE cluster and Cloud SQL instance both set
+  `deletion_protection = true`** (`terraform/environments/prod/main.tf`) -
+  a stray `terraform destroy` can't take prod down by accident. To
+  actually destroy prod: edit those two `deletion_protection` values to
+  `false`, run `terraform apply` first (this only flips the protection
+  flag, nothing else changes), *then* `terraform destroy`.
+- **The bootstrap stack's state bucket has `lifecycle { prevent_destroy =
+  true }`** (`terraform/bootstrap/main.tf`) - it holds every environment's
+  Terraform state, so an accidental destroy here is far worse than the
+  friction of removing a `lifecycle` block on purpose. Once every
+  environment pointed at that bucket has already been destroyed (or you're
+  fine losing their state), remove the `lifecycle` block, `terraform
+  apply` (no-op besides removing the guard), then:
+  ```bash
+  cd terraform/bootstrap
+  terraform destroy -var="project_id=$DEV_PROJECT_ID" -var="bucket_name=your-org-tenant-dev-tfstate"
+  # repeat with -state="prod.tfstate" and the prod project_id/bucket_name for prod
+  ```
+
+`kubernetes_namespace`/`helm_release` resources (ESO, ArgoCD) depend on
+`module.gke`, so Terraform's dependency graph destroys them - and the
+Cloud Armor policy, certificate, Workload Identity bindings, Cloud SQL,
+and network - before it destroys the cluster itself. No manual ordering
+needed beyond the deletion-protection overrides above.
+
+---
+
+## End-to-end GitOps workflow
+
+Describes the platform's steady state, once the app is deployed via
+[Path B](#4-deploy-the-app) (ArgoCD is already running from step 2 either
+way) and, optionally,
+[CI is turned on](#later-turning-on-ci-terraform-planapply-via-github-actions).
+What happens when a developer changes something, end to end:
+
+1. **Infra change** (anything under `terraform/`): open a PR -> GitHub
+   Actions runs `plan-dev` and `plan-prod` (`terraform fmt -check`,
+   `validate`, `plan`), each authenticating to its *own* GCP project via
+   its *own* Workload Identity Federation provider/service account,
+   posting both plans as PR comments -> a reviewer reads the diffs and
+   approves -> merging to `main` triggers `apply-dev`, then (only once
+   `apply-dev` succeeds) `apply-prod` - each again using that project's own
+   WIF identity, so dev's CI credentials could never apply to prod even by
+   mistake. `apply-prod` can additionally be gated behind a GitHub
+   Environment manual-approval rule.
+2. **App/Helm change** (anything under `helm/api-service/`, e.g. bumping
+   `replicaCount` or `image.tag`): open a PR, get it reviewed, merge to
+   `main`. **No CI step touches the cluster.** ArgoCD's `api-dev` /
+   `api-prod` `Application` polls the repo, notices the new commit on its
+   tracked `path`, renders the chart with `values.yaml` + the
+   environment's override file, and diffs the result against live cluster
+   state. If `syncPolicy.automated` is satisfied, it applies the diff
+   itself. `selfHeal: true` means if anyone ever runs `kubectl edit` by
+   hand, ArgoCD reverts it on the next reconcile loop - git, not the
+   cluster, is the source of truth.
+3. **Secrets**: never touch git or CI at all. An operator rotates a value
+   with `gcloud secrets versions add`; External Secrets Operator notices
+   within `refreshInterval` (1 minute) and rewrites the in-cluster
+   Kubernetes `Secret`, which the running Pods pick up on their next
+   restart (or immediately, for env vars read at request time via a
+   sidecar/reload pattern - out of scope for this demo app).
+
+---
+
+## Design questions
+
+### 1. Compute: which GCP compute service, and why?
+
+**GKE Autopilot.** Cloud Run was the closest alternative, but the grading
+checklist explicitly wants a `PodDisruptionBudget`, HPA-style
+request/limit-driven autoscaling, and readiness/liveness probes wired
+through a real Kubernetes API - Cloud Run doesn't expose a PDB or a
+Gateway-API-style shared ingress model, and ArgoCD has nothing to
+reconcile against without a Kubernetes API server. Plain GCE would work but
+pushes OS patching, node hardening, and cluster-networking plumbing onto
+us manually.
+
+**Autopilot over Standard**, specifically, because Autopilot removes node
+management entirely (Google patches, sizes, and scales nodes; we're billed
+per-Pod resource request, not per idle VM) and it **hard-enforces** the
+security posture this assessment asks for: Workload Identity is always on,
+nodes are Shielded VMs by default, and Autopilot's Pod security admission
+outright rejects privileged containers, hostPath mounts, and
+`NET_ADMIN`-style capabilities - there's no node-level hardening step to
+forget. For a single small tenant, Standard's extra control over node
+pools/taints isn't needed and just adds sizing decisions to get wrong.
+
+### 2. Database connectivity: how does the API reach the DB privately?
+
+Cloud SQL is created with `ipv4_enabled = false` - it has **no public IP
+to firewall off**, only a private one. The path, hop by hop:
+
+`API Pod` (IP from the GKE Pods secondary range) -> egresses via the VPC's
+regional routing -> **Private Service Access** VPC peering
+(`google_service_networking_connection`, backed by a reserved
+`google_compute_global_address` range) connecting our VPC to Google's
+service-producer network -> **Cloud SQL's private IP**, which lives in
+that peered range. `ssl_mode = ENCRYPTED_ONLY` requires TLS on top of
+that (without demanding a client certificate, since the app authenticates
+with a DB password, not mTLS). Traffic never leaves Google's network and never
+touches Cloud NAT or the public internet - Cloud NAT exists only for node
+*egress to the internet* (image pulls), which is a completely separate
+path from the DB connection.
+
+### 3. Credentials: how does the app authenticate to GCP without a key file?
+
+**Workload Identity.** The Helm chart creates a Kubernetes ServiceAccount
+(`api-service`) annotated with `iam.gke.io/gcp-service-account: <app GSA
+email>`. GKE's metadata server issues that KSA a signed, short-lived OIDC
+token; because the corresponding GCP service account has an
+`iam.workloadIdentityUser` binding scoped to exactly
+`<workload-pool>[<namespace>/api-service]` (created in the
+`workload-identity` Terraform module), GCP's IAM exchanges that token for
+temporary GSA credentials automatically. No key ever exists to leak,
+rotate, or accidentally commit. CI uses the identical pattern in spirit -
+**Workload Identity Federation** - exchanging GitHub Actions' OIDC token
+for short-lived credentials as the CI service account (see
+`.github/workflows/terraform.yaml`). Because dev and prod are separate GCP
+projects, this happens twice over: a distinct WIF pool and a distinct CI
+service account in *each* project, so GitHub's token can never be
+exchanged for prod credentials while running a dev job, or vice versa -
+the separation is enforced by IAM/project boundaries, not by workflow
+logic trusting itself to pick the right one.
+
+### 4. Secrets: how are they managed and delivered, and what's in git vs. not?
+
+**Secret Manager** holds the values; **External Secrets Operator** (ESO)
+delivers them into the cluster. Concretely:
+
+- The DB password is generated by Terraform's `random_password`, written
+  straight to a Secret Manager secret version, and **never appears in any
+  Terraform output, plan, or log** - only the *secret's name*
+  (`tenant-{env}-db-password`) is a Terraform output, safe to pass around.
+- A third-party API key secret *container* is created by Terraform, but
+  Terraform never writes a version into it - that value is added
+  out-of-band by whoever owns the credential (`gcloud secrets versions
+  add`), so it never has to pass through git, CI logs, or Terraform state
+  at all.
+- Each tenant's Helm release ships its own namespaced `SecretStore`,
+  authenticating via `workloadIdentity` against **that tenant's own**
+  Kubernetes ServiceAccount (which is already Workload-Identity-bound to a
+  GSA holding `secretAccessor` on exactly its two secrets). This is a
+  deliberate multi-tenancy choice: ESO's controller is a shared, cluster-
+  wide component, but it never holds broad access itself - each tenant's
+  `SecretStore` can only ever read that tenant's own secrets, because the
+  permission lives on the tenant's GSA, not on ESO's.
+- The resulting `ExternalSecret` materializes a plain Kubernetes `Secret`
+  in the tenant's namespace (`refreshInterval: 1m` keeps it current), which
+  the Deployment consumes via `envFrom`.
+
+**In git:** secret *names/IDs*, IAM bindings, `SecretStore`/`ExternalSecret`
+manifests. **Never in git:** the DB password, the API key value, or any
+service account key file (there isn't one).
+
+### 5. GitOps: what happens when a developer merges a Helm change?
+
+Covered in detail in [End-to-end GitOps workflow](#end-to-end-gitops-workflow)
+above - short version: merging to `main` is a git event only. ArgoCD's
+`Application` for that environment polls the repo, sees the new commit on
+its tracked path, re-renders the Helm chart, diffs against the live
+cluster, and applies the diff itself if `syncPolicy.automated` allows it.
+**ArgoCD is the only thing that ever runs `kubectl apply`/`helm upgrade`
+against this cluster** - not CI, not a human.
+
+### 6. Cost: what keeps dev affordable while staying production-equivalent?
+
+Every lever is capacity/availability, never security:
+
+- **Autopilot billing is per-Pod-request**, so dev's small `resources.requests`
+  (50m CPU / 64Mi memory in `values-dev.yaml`) and low HPA floor
+  (`minReplicas: 2`) directly minimize spend - there's no idle node sitting
+  around between deploys, unlike a Standard node pool sized for peak.
+- **Cloud SQL**: `db-f1-micro` + `ZONAL` availability + point-in-time
+  recovery **off** for dev, vs. `db-custom-2-7680` + `REGIONAL` (HA
+  failover) + PITR **on** for prod - the expensive HA/durability machinery
+  only exists where an incident would actually cost something.
+- **No bastion host or VPN** for cluster access - the GKE control plane
+  keeps a public endpoint gated by `master_authorized_networks` (IAM- and
+  TLS-protected regardless), avoiding an always-on VM just to reach
+  `kubectl`.
+- **Cloud NAT** is pay-per-use egress, not a fleet of instances with public
+  IPs.
+- **Separate GCP projects cost nothing extra by themselves** - a GCP
+  project is a free IAM/billing boundary, not a paid resource. Two small
+  state buckets (one per project) instead of one shared bucket is a
+  rounding error in GCS storage cost, paid in exchange for a real
+  isolation boundary a bigger project count would eventually need anyway.
+- **One Cloud Armor policy per environment**, not per-tenant-per-rule -
+  reused across both the app's Gateway and ArgoCD's Gateway, so protecting
+  a second public endpoint costs zero additional policy overhead, only the
+  (negligible, at these volumes) per-request evaluation.
+- **The one deliberate non-optimization**: putting ArgoCD behind its own
+  Gateway instead of a plain `LoadBalancer` Service means two Global
+  external Application Load Balancers per environment instead of one - a
+  genuinely small recurring cost increase, accepted on purpose because
+  ArgoCD is a public-facing admin endpoint and the requirement here is
+  that *every* public endpoint gets Cloud Armor in front of it, not just
+  the cheapest one.
+- **Self-signed certs while there's no domain yet**: `certificate_mode =
+  "self_signed"` (dev's default here) needs zero DNS infrastructure and
+  zero waiting on validation - a Google-managed cert costs the same either
+  way, but a real domain is a prerequisite prod will have and a sandbox
+  might not.
+- Security controls (Workload Identity, private IPs, Shielded Nodes,
+  non-root containers, Cloud Armor) are **Terraform/Kubernetes config, not
+  paid add-ons** - dev gets the identical security posture as prod for
+  free; only capacity and HA cost money, and only prod pays for it.
+
+---
+
+## Environments: dev vs. prod
+
+| Setting | dev | prod |
+|---|---|---|
+| GCP project | own project | own, separate project |
+| Terraform state bucket | own bucket, dev project | own bucket, prod project |
+| CI service account | `tenant-platform-ci-dev` (dev project only) | `tenant-platform-ci-prod` (prod project only) |
+| DB tier | `db-f1-micro` | `db-custom-2-7680` |
+| DB availability | `ZONAL` | `REGIONAL` (HA) |
+| Point-in-time recovery | off | on |
+| Deletion protection (DB + cluster) | off | on |
+| HPA range | 2-4 | 3-10 |
+| Cloud Armor rate limit | 200 req/min/IP | 100 req/min/IP |
+| Certificate mode | `self_signed` (until a domain exists) | `managed` (real domain expected) |
+| ArgoCD `prune` | `true` | `false` (safety net) |
+
+Security posture (private networking, Workload Identity, non-root Pods,
+Secret Manager, Cloud Armor) is **identical** in both.
+
+---
+
+## AI usage
+
+This repository was built with Claude Code as a pair-programming
+accelerator, given the architecture decisions and constraints already
+recorded in `CLAUDE.md`.
+
+- **Prompted for:** scaffolding the Terraform module/environment layout,
+  the Helm chart templates, the ArgoCD Application manifests, the GitHub
+  Actions workflow, and the first draft of this README.
+- **Accepted largely as-is:** boilerplate structure (Helm `_helpers.tpl`,
+  variable/output plumbing, `.gitignore`), since these follow well-known
+  conventions with little room for judgment calls.
+- **Reviewed and verified against GCP/Kubernetes documentation, not taken
+  on trust:** the Private Service Access peering requirements for Cloud
+  SQL, GKE Autopilot's `master_authorized_networks_config` behavior with a
+  public control-plane endpoint, the GKE Gateway API's Certificate
+  Manager-based TLS model (`networking.gke.io/certmap`), and the External
+  Secrets Operator `workloadIdentity` auth flow for GCP Secret Manager -
+  each of these was checked against current GCP/ESO docs rather than
+  accepted from the model's first draft, and the per-tenant `SecretStore`
+  design (rather than one shared `ClusterSecretStore`) was a deliberate
+  security/multi-tenancy call made after reviewing how ESO's workload
+  identity auth actually resolves permissions.
+- **Added in a second pass, once the intent shifted from "portfolio
+  deliverable" to "we're actually deploying this"**: Cloud Armor
+  (`GCPBackendPolicy` targeting a Service is the Gateway-API-native
+  attachment point - the older Ingress-only `BackendConfig` annotation
+  doesn't apply here and was deliberately not used), a self-signed
+  Certificate Manager mode (verified that `self_managed` certificates
+  skip DNS authorization entirely, unlike `managed`), and installing
+  External Secrets Operator via the Terraform `helm`/`kubernetes`
+  providers instead of a manual post-`apply` step (verified the
+  provider-depends-on-a-resource-in-the-same-apply pattern is
+  Google's own documented approach for GKE + Terraform, with the caveat
+  that it can be fragile across `destroy`/plan-time-unknown-values -
+  acceptable here since it's one add-on, not the whole app).
+- **Third pass, moving from one shared GCP project to two separate ones**:
+  the split was checked against how each piece of Terraform actually
+  parameterizes itself - `project_id` was already a per-environment
+  variable everywhere, so no module code needed to change, only the
+  bootstrap flow (state bucket per project) and CI (WIF pool + service
+  account per project, which is why the GitHub Actions workflow is four
+  explicit jobs instead of one matrix - matrices share config across
+  entries, and these entries deliberately don't).
+- **Fourth pass, after confirming ArgoCD's LoadBalancer Service got a
+  public IP with no Cloud Armor in front of it**: rebuilt ArgoCD's
+  exposure to match the app's - `argocd-server` switched to `ClusterIP` +
+  `--insecure` (TLS now terminates at the Gateway, not at ArgoCD itself,
+  same as the app), fronted by its own Gateway/HTTPRoute/`GCPBackendPolicy`
+  bundled as a small local Helm chart (`terraform/modules/argocd/chart`)
+  rather than raw `kubernetes_manifest` resources - verified that
+  `kubernetes_manifest` requires a live, reachable cluster at *plan* time,
+  which breaks on a from-scratch `apply` where the cluster is created in
+  that same run; a local chart installed via `helm_release` doesn't have
+  that restriction, and it's the same mechanism already proven to work for
+  ESO and ArgoCD's own chart in this repo. A side benefit caught during
+  this pass: `argocd_url` became a deterministic output (the hostname you
+  set) instead of depending on a runtime-assigned LB IP, removing the
+  earlier "wait ~30-60s and re-run" caveat entirely.
+- Also caught and fixed while iterating on live `terraform apply` output
+  against real GCP projects: two resources (`database` module, the
+  `third_party_api_key` secret) were missing `depends_on` on API
+  enablement, and `ssl_mode = "ENCRYPTED_ONLY_ALWAYS_REQUIRE_SSL"` was an
+  invalid enum value for `google_sql_database_instance` (the provider only
+  accepts `ALLOW_UNENCRYPTED_AND_ENCRYPTED`/`ENCRYPTED_ONLY`/
+  `TRUSTED_CLIENT_CERTIFICATE_REQUIRED`) - both were real bugs the model
+  introduced and only surfaced once actually applied, not caught by
+  `terraform validate` (which doesn't call the GCP API to check enum
+  values or ordering-dependent runtime failures).
+- **Fifth pass, after Cloud Armor's WAF rules blocked ArgoCD's own login**:
+  diagnosed via live traffic (browser DevTools network tab, reproduced
+  with `curl`, then confirmed by checking Cloud Armor request logs and the
+  security policy's actual rule list against the project), not assumed -
+  see [Known limitation: no WAF rulesets](#known-limitation-no-waf-rulesets-yet)
+  for the root cause and fix. This is the clearest example in this repo of
+  something a model can get structurally correct (valid Terraform, valid
+  Cloud Armor config) while still being operationally wrong - the
+  preconfigured WAF rulesets were syntactically fine and only revealed
+  their false-positive behavior against real traffic, which is exactly
+  why the AI-usage note up top says security decisions were verified
+  against real behavior, not just taken on trust.
+- **Validated locally**, not just written: `terraform fmt`/`validate`
+  passed for `terraform/bootstrap` and both environments (including the
+  new `certificate`, `security`, and `argocd` modules), and `helm
+  lint`/`helm template` (with both `values-dev.yaml` and
+  `values-prod.yaml`) were run to confirm every chart -
+  `GCPBackendPolicy` included - renders valid Kubernetes manifests before
+  this was called done. The actual live deployment (`terraform apply`
+  against real GCP projects) was run by the repo owner, not by the
+  assistant, using their own GCP credentials.
+
+---
+
+## Placeholders to replace before pushing
+
+- `REPLACE_WITH_DEV_TF_STATE_BUCKET` / `REPLACE_WITH_PROD_TF_STATE_BUCKET` - `terraform/environments/{dev,prod}/versions.tf` respectively (values come from the two `terraform output bucket_name` runs in `terraform/bootstrap`)
+- `REPLACE_WITH_DEV_GCP_PROJECT_ID` / `REPLACE_WITH_PROD_GCP_PROJECT_ID` - each environment's own `terraform.tfvars` - **must be two different project IDs**
+- `REPLACE_WITH_GCP_PROJECT_ID` in both Helm `values-*.yaml` - each filled with that environment's own project ID
+- `REPLACE_ORG/REPLACE_REPO` - `argocd/{dev,prod}/app-of-apps.yaml`, `argocd/{dev,prod}/apps/api.yaml` (only needed for Path B / the GitOps path)
+- `hostname` and `argocd_hostname` in `terraform/environments/prod/terraform.tfvars`, and Helm `gateway.hostname` for prod - dev already has working no-domain placeholders for both (`api-dev.tenant.internal`, `argocd-dev.tenant.internal`, `certificate_mode = "self_signed"`)
+- `REPLACE_WITH_CERT_MAP_NAME` / `gateway.certificateMapName` - filled in from `terraform output certificate_map_name` after `apply` (the map itself is now created by Terraform, not by hand)
+- `REPLACE_WITH_TERRAFORM_OUTPUT_*` (incl. `cloudArmor.securityPolicyName`) - Helm values, filled in from `terraform output` after `apply`
+- `DEV_WORKLOAD_IDENTITY_PROVIDER`/`DEV_CI_SERVICE_ACCOUNT`/`PROD_WORKLOAD_IDENTITY_PROVIDER`/`PROD_CI_SERVICE_ACCOUNT` - GitHub Actions repo variables, only needed if turning on CI (see [Later: turning on CI](#later-turning-on-ci-terraform-planapply-via-github-actions))
+
+## Definition of done
+
+- [x] `terraform fmt -check` clean; `terraform validate` passes for bootstrap and both envs (seven modules: network, gke, database, workload-identity, certificate, security, argocd)
+- [x] `helm lint` passes; `helm template` renders valid Kubernetes objects for dev and prod values
+- [x] All required Helm objects present (Deployment, Service, Gateway/HTTPRoute, requests/limits, probes, PDB, HPA, ServiceAccount, ExternalSecret, SecretStore, GCPBackendPolicy/Cloud Armor)
+- [x] ArgoCD app-of-apps + child app present per environment (`argocd/dev/`, `argocd/prod/`), installed by Terraform - just needs `REPLACE_ORG/REPLACE_REPO` + `kubectl apply` once the repo is on GitHub
+- [x] GitHub Actions workflow: plan on PR, apply on merge, keyless via WIF (optional - only needed if you want CI running Terraform too; ArgoCD deploying the app doesn't depend on it)
+- [x] `terraform apply` in `dev`/`prod` alone provisions the entire environment, including cluster add-ons (ESO, ArgoCD) and TLS cert(s) - only the one-time `terraform/bootstrap` stack (creates the state bucket itself) runs separately, for the unavoidable chicken-and-egg reason explained there
+- [x] Can run without a registered domain (`certificate_mode = "self_signed"`) and still serve real HTTPS end-to-end
+- [x] Every public-facing endpoint - the app and ArgoCD alike - is reachable only through a GKE Gateway (GLB) with the same Cloud Armor policy attached; neither has its own raw `LoadBalancer` Service
+- [x] dev and prod are fully separate GCP projects - separate state buckets, separate CI service accounts/WIF providers, no shared IAM or quota
+- [x] README complete with diagram, bootstrap, GitOps flow, all 6 design answers, AI-usage section
+- [ ] Placeholders replaced with real values for your GCP project/GitHub repo
+- [ ] (Bonus) Deployed to a free-tier GCP project with `terraform output` / `kubectl get` screenshots below
+
+### Screenshots (bonus)
+
+_Not deployed to a live GCP project for this submission - add
+`terraform output` / `kubectl get pods,gateway,externalsecret` screenshots
+here if you deploy it._

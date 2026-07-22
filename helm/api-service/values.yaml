@@ -1,0 +1,117 @@
+# Default values for api-service.
+# Environment-specific overrides live in values-dev.yaml / values-prod.yaml
+# and are layered on top of this file by the ArgoCD Application manifests.
+
+replicaCount: 2
+
+image:
+  # nginx-unprivileged: runs as a non-root user out of the box, listens on
+  # 8080 instead of 80 - no NET_BIND_SERVICE capability needed. Stands in
+  # for "a real app" per the assessment brief.
+  repository: nginxinc/nginx-unprivileged
+  tag: "1.27-alpine"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Name of the Kubernetes ServiceAccount created by this chart. Must match
+  # the KSA name used in the Workload Identity binding in Terraform
+  # (module.workload_identity app_k8s_service_account).
+  name: api-service
+  # GCP service account this KSA impersonates via Workload Identity.
+  # Injected per-environment from Terraform output `app_service_account_email`.
+  gcpServiceAccountEmail: ""
+
+service:
+  port: 80
+  targetPort: 8080
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+probes:
+  readiness:
+    path: /
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    path: /
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+pdb:
+  # Guarantees at least this many Pods stay up during voluntary disruptions
+  # (node drains, cluster upgrades) - Autopilot upgrades nodes frequently.
+  minAvailable: 1
+
+gateway:
+  # GKE's external, globally-routed Gateway class - provisions a global
+  # HTTPS Application Load Balancer with a Google-managed TLS certificate.
+  className: gke-l7-global-external-managed
+  hostname: "REPLACE_WITH_HOSTNAME.example.com"
+  # Certificate Manager certificate map backing the Google-managed TLS cert
+  # for this hostname. Create out-of-band (see README) - not modeled in
+  # Terraform because certificate maps are shared, slow-to-provision, and
+  # DNS-validated, not a good fit for per-`apply` lifecycle.
+  certificateMapName: "REPLACE_WITH_CERT_MAP_NAME"
+
+cloudArmor:
+  # Cloud Armor security policy name (from the security Terraform module's
+  # `security_policy_name` output). Leave blank to render without a
+  # GCPBackendPolicy - the Service is then only protected by whatever the
+  # Gateway does by default.
+  securityPolicyName: ""
+
+database:
+  # Cloud SQL private IP + connection info. None of this is secret - it's
+  # only reachable from inside the VPC - so it's plain Helm values, not
+  # Secret Manager.
+  host: ""
+  port: 5432
+  name: appdb
+  user: appuser
+
+externalSecrets:
+  # GCP project/cluster coordinates the SecretStore needs to build the
+  # Workload Identity auth flow to Secret Manager.
+  gcpProjectId: "REPLACE_WITH_GCP_PROJECT_ID"
+  gcpRegion: us-central1
+  clusterName: "REPLACE_WITH_CLUSTER_NAME"
+  # Secret Manager secret IDs (names only - see the database & environment
+  # Terraform modules for where these are created).
+  dbPasswordSecretId: ""
+  thirdPartyApiKeySecretId: ""
+  # How often ESO polls Secret Manager for changes and refreshes the
+  # generated Kubernetes Secret.
+  refreshInterval: 1m
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 101
+  runAsGroup: 101
+  fsGroup: 101
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL

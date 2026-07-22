@@ -1,0 +1,8 @@
+# All of these are overridden by `set` blocks in the argocd module's
+# helm_release.argocd_gateway resource - defaults here are placeholders.
+hostname: ""
+certificateMapName: ""
+securityPolicyName: ""
+gatewayClassName: gke-l7-global-external-managed
+serviceName: argocd-server
+servicePort: 80

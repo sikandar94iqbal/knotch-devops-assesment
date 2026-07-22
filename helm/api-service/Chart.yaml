@@ -1,0 +1,9 @@
+apiVersion: v2
+name: api-service
+description: >-
+  Multi-tenant backend API service - Deployment, Service, GKE Gateway
+  route, HPA, PDB, and External Secrets Operator wiring for a single
+  tenant/environment.
+type: application
+version: 0.1.0
+appVersion: "1.27"

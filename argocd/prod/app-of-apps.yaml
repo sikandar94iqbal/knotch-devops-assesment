@@ -1,0 +1,30 @@
+# App-of-Apps root for the PROD cluster's own ArgoCD instance. Applied
+# once, by hand, to the prod cluster only (see README bootstrap).
+#
+# Points ONLY at argocd/prod/apps/ - this cluster's ArgoCD never sees dev's
+# Application manifests, because dev and prod are separate GKE clusters
+# with entirely separate ArgoCD installs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/REPLACE_ORG/REPLACE_REPO.git
+    targetRevision: main
+    path: argocd/prod/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      # Prod's app-of-apps still auto-heals drift, but never auto-prunes -
+      # matches the same safety net as the api-prod Application below.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

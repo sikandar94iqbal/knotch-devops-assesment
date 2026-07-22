@@ -1,0 +1,9 @@
+apiVersion: v2
+name: argocd-gateway
+description: >-
+  Gateway + HTTPRoute + GCPBackendPolicy exposing argocd-server through the
+  platform's global HTTPS load balancer and Cloud Armor policy - not a
+  separate, unprotected LoadBalancer Service.
+type: application
+version: 0.1.0
+appVersion: "1.0"

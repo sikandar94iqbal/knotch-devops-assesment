@@ -1,0 +1,34 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Never commit real tfvars with secrets - only the .example ones are tracked
+*.auto.tfvars
+!*.auto.tfvars.example
+
+# Helm
+helm/**/charts/*.tgz
+helm/**/Chart.lock
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local scratch
+*.local
+.env
+.env.*

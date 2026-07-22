@@ -1,0 +1,61 @@
+{{- $secretName := "argocd-gateway-tls-placeholder" }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
+---
+# Gateway API's core schema requires at least one entry in
+# `certificateRefs` when a listener's TLS mode is Terminate - but GKE
+# actually serves TLS from the Certificate Manager map referenced by the
+# `networking.gke.io/certmap` annotation below, and ignores this Secret's
+# contents entirely. This placeholder exists purely to satisfy that schema
+# requirement; do not read anything security-relevant into it. Reused
+# across upgrades via `lookup` so it doesn't churn on every deploy.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+type: kubernetes.io/tls
+data:
+  {{- if $existing }}
+  tls.crt: {{ index $existing.data "tls.crt" }}
+  tls.key: {{ index $existing.data "tls.key" }}
+  {{- else }}
+  {{- $cert := genSelfSignedCert .Values.hostname nil (list .Values.hostname) 3650 }}
+  tls.crt: {{ $cert.Cert | b64enc }}
+  tls.key: {{ $cert.Key | b64enc }}
+  {{- end }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: argocd-gateway
+  annotations:
+    # Points the managed HTTPS listener at the same Certificate Manager
+    # certificate map mechanism the app's Gateway uses (managed or
+    # self-signed, per the environment's certificate_mode). This is what
+    # actually serves TLS - the certificateRefs Secret above is just
+    # schema filler, not the real cert.
+    networking.gke.io/certmap: {{ .Values.certificateMapName | quote }}
+spec:
+  # Global external HTTPS Application Load Balancer - the one and only
+  # inbound path to argocd-server, same class as the app's Gateway.
+  gatewayClassName: {{ .Values.gatewayClassName }}
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: {{ .Values.hostname | quote }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: {{ $secretName }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: http
+      # Kept only to serve the HTTP->HTTPS redirect below; never forwards
+      # plaintext traffic to argocd-server.
+      protocol: HTTP
+      port: 80
+      hostname: {{ .Values.hostname | quote }}
+      allowedRoutes:
+        namespaces:
+          from: Same

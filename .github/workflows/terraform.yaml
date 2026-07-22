@@ -1,0 +1,207 @@
+name: Terraform
+
+# Runs `terraform plan` on every PR that touches terraform/, and
+# `terraform apply` on every push to main that touches terraform/. Auth to
+# GCP is keyless: GitHub's OIDC token is exchanged for short-lived GCP
+# credentials via Workload Identity Federation - there is no service
+# account key stored as a repo secret.
+#
+# Dev and prod are separate GCP projects, each with their own CI service
+# account and WIF provider (see the README's CI bootstrap section) - so
+# this is deliberately four near-identical jobs instead of one matrix job.
+# A matrix works when every entry shares the same credentials; here each
+# environment needs its own, so each gets its own explicit job instead of
+# a dynamic/computed variable lookup.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yaml"
+
+permissions:
+  contents: read
+  id-token: write # required to mint the OIDC token WIF exchanges for GCP creds
+  pull-requests: write # lets the plan jobs comment results back on the PR
+
+env:
+  TF_VERSION: "1.5.7"
+
+jobs:
+  plan-dev:
+    if: github.event_name == 'pull_request'
+    name: plan (dev)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to the DEV GCP project via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          # These two repo-level Actions Variables (Settings -> Secrets and
+          # variables -> Actions -> Variables) are identifiers, not
+          # secrets - set once after bootstrapping CI for the dev project.
+          workload_identity_provider: ${{ vars.DEV_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.DEV_CI_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive ../../
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        id: plan
+        run: terraform plan -input=false -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan - \`dev\`
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output,
+            });
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  plan-prod:
+    if: github.event_name == 'pull_request'
+    name: plan (prod)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/environments/prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to the PROD GCP project via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.PROD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.PROD_CI_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive ../../
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        id: plan
+        run: terraform plan -input=false -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan - \`prod\`
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output,
+            });
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply-dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: apply (dev)
+    runs-on: ubuntu-latest
+    # A GitHub Environment named "dev" - add required-reviewer protection
+    # rules here in repo Settings if you want dev applies gated too;
+    # unprotected by default.
+    environment: dev
+    defaults:
+      run:
+        working-directory: terraform/environments/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to the DEV GCP project via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.DEV_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.DEV_CI_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform apply
+        run: terraform apply -input=false -auto-approve
+
+  apply-prod:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: apply (prod)
+    runs-on: ubuntu-latest
+    # dev applies first (see `needs:` below) - a bad dev apply stops the
+    # workflow before it ever touches prod. Add required-reviewer
+    # protection rules to the "prod" GitHub Environment in repo Settings
+    # so a merge to main pauses for manual sign-off before this job runs.
+    needs: apply-dev
+    environment: prod
+    defaults:
+      run:
+        working-directory: terraform/environments/prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to the PROD GCP project via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.PROD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.PROD_CI_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: terraform apply
+        run: terraform apply -input=false -auto-approve

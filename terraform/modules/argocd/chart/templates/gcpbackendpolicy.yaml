@@ -1,0 +1,16 @@
+{{- if .Values.securityPolicyName }}
+# Attaches the same Cloud Armor policy protecting the app to argocd-server
+# too - the admin UI gets identical WAF/rate-limit coverage, not a weaker
+# carve-out just because it's "internal tooling".
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: argocd-server
+spec:
+  default:
+    securityPolicy: {{ .Values.securityPolicyName | quote }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ .Values.serviceName }}
+{{- end }}

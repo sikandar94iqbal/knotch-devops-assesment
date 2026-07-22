@@ -1,0 +1,60 @@
+// Render with: dot -Tsvg architecture.dot -o architecture.svg
+// (or paste at https://dreampuf.github.io/GraphvizOnline/)
+digraph architecture {
+  rankdir=LR;
+  fontname="Helvetica";
+  node [fontname="Helvetica", shape=box, style="rounded,filled", fillcolor="#f4f4f4"];
+  edge [fontname="Helvetica", fontsize=10];
+
+  subgraph cluster_internet {
+    label="Internet";
+    style=dashed;
+    customer [label="Customer\n(HTTPS)", shape=oval, fillcolor="#e8f0fe"];
+  }
+
+  subgraph cluster_gcp {
+    label="GCP Project";
+    style=dashed;
+
+    glb [label="Global External HTTPS\nApplication Load Balancer\n(GKE Gateway API +\nGoogle-managed TLS cert)", fillcolor="#d2e3fc"];
+
+    subgraph cluster_vpc {
+      label="VPC (private, custom-mode)";
+      style=dashed;
+
+      subgraph cluster_gke {
+        label="GKE Autopilot cluster\n(private nodes, Workload Identity)";
+        style=dashed;
+
+        pod [label="API Pod\n(nginx-unprivileged,\nnon-root, RO rootfs)", fillcolor="#ceead6"];
+        eso [label="External Secrets\nOperator", fillcolor="#ceead6"];
+      }
+
+      nat [label="Cloud NAT\n(outbound only,\nno public node IPs)", fillcolor="#fce8e6"];
+      cloudsql [label="Cloud SQL Postgres\n(private IP only,\nipv4_enabled=false)", fillcolor="#fef7e0"];
+    }
+
+    secretmanager [label="Secret Manager\n(DB password,\nthird-party API key)", fillcolor="#fef7e0"];
+    argocd [label="ArgoCD\n(in-cluster,\nauto-sync + self-heal)", fillcolor="#e6e6fa"];
+  }
+
+  subgraph cluster_git {
+    label="Git / CI";
+    style=dashed;
+    github [label="GitHub repo\n(Terraform + Helm + ArgoCD manifests)", shape=oval, fillcolor="#fff2cc"];
+    actions [label="GitHub Actions\n(plan on PR, apply on merge,\nkeyless via Workload Identity Federation)", fillcolor="#fff2cc"];
+  }
+
+  customer -> glb [label="HTTPS/443"];
+  glb -> pod [label="HTTP (health-checked)"];
+  pod -> cloudsql [label="private IP\n(VPC peering)"];
+  pod -> nat [style=dotted, label="image pulls\n(egress only)"];
+  eso -> secretmanager [label="Workload Identity\n(no key files)"];
+  eso -> pod [label="materializes\nK8s Secret"];
+
+  github -> actions [label="PR / merge"];
+  actions -> cloudsql [label="terraform apply\n(WIF, keyless)", style=dashed];
+  actions -> glb [label="terraform apply\n(WIF, keyless)", style=dashed];
+  github -> argocd [label="git pull\n(Helm chart)", style=dashed];
+  argocd -> pod [label="sync\n(no manual kubectl)"];
+}

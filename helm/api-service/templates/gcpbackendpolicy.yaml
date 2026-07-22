@@ -1,0 +1,19 @@
+{{- if .Values.cloudArmor.securityPolicyName }}
+# Attaches the Cloud Armor security policy (created by the security
+# Terraform module) to this Service's backend - every request the Gateway
+# forwards here passes through Cloud Armor's WAF rules and rate limiting
+# first.
+apiVersion: networking.gke.io/v1
+kind: GCPBackendPolicy
+metadata:
+  name: {{ include "api-service.fullname" . }}
+  labels:
+    {{- include "api-service.labels" . | nindent 4 }}
+spec:
+  default:
+    securityPolicy: {{ .Values.cloudArmor.securityPolicyName | quote }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: {{ include "api-service.fullname" . }}
+{{- end }}

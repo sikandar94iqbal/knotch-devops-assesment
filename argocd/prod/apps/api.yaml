@@ -1,0 +1,33 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/REPLACE_ORG/REPLACE_REPO.git
+    targetRevision: main
+    path: helm/api-service
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-prod.yaml
+  destination:
+    # Same cluster this ArgoCD instance runs on - prod's ArgoCD only ever
+    # manages prod's own cluster.
+    server: https://kubernetes.default.svc
+    namespace: tenant-prod
+  syncPolicy:
+    automated:
+      # prune: false is a deliberate safety net for prod - a manifest
+      # accidentally deleted from git removes it from ArgoCD's tracked
+      # state, not from the live cluster. Someone has to consciously
+      # `argocd app sync --prune` (or flip this back to true) to actually
+      # remove a prod resource.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

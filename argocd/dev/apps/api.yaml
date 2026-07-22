@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/REPLACE_ORG/REPLACE_REPO.git
+    targetRevision: main
+    path: helm/api-service
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-dev.yaml
+  destination:
+    # Same cluster this ArgoCD instance runs on - dev's ArgoCD only ever
+    # manages dev's own cluster.
+    server: https://kubernetes.default.svc
+    namespace: tenant-dev
+  syncPolicy:
+    automated:
+      # Dev is disposable: a deleted Helm template should disappear from
+      # the cluster on the next sync, same as it would with `helm upgrade`.
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

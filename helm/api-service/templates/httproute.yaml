@@ -1,0 +1,37 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "api-service.fullname" . }}-https
+  labels:
+    {{- include "api-service.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ include "api-service.fullname" . }}
+      sectionName: https
+  hostnames:
+    - {{ .Values.gateway.hostname | quote }}
+  rules:
+    - backendRefs:
+        - name: {{ include "api-service.fullname" . }}
+          port: {{ .Values.service.port }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "api-service.fullname" . }}-http-redirect
+  labels:
+    {{- include "api-service.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ include "api-service.fullname" . }}
+      sectionName: http
+  hostnames:
+    - {{ .Values.gateway.hostname | quote }}
+  rules:
+    # Every plaintext request gets redirected to HTTPS - the platform never
+    # serves application traffic unencrypted, even on the redirect hop.
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

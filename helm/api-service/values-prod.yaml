@@ -1,0 +1,45 @@
+# Overrides layered on top of values.yaml for the prod environment.
+# Non-placeholder values below (project ID, cluster name, DB host, SA
+# email) are filled in from `terraform output` after `terraform apply` in
+# terraform/environments/prod - see the README bootstrap section.
+
+replicaCount: 3
+
+autoscaling:
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+pdb:
+  minAvailable: 2
+
+gateway:
+  hostname: "api.REPLACE_WITH_DOMAIN.com"
+  certificateMapName: "tenant-prod-certmap"
+
+cloudArmor:
+  securityPolicyName: "REPLACE_WITH_TERRAFORM_OUTPUT_security_policy_name"
+
+serviceAccount:
+  gcpServiceAccountEmail: "REPLACE_WITH_TERRAFORM_OUTPUT_app_service_account_email"
+
+database:
+  host: "REPLACE_WITH_TERRAFORM_OUTPUT_database_private_ip"
+  name: appdb
+  user: appuser
+
+externalSecrets:
+  gcpProjectId: "REPLACE_WITH_GCP_PROJECT_ID"
+  gcpRegion: us-central1
+  clusterName: "tenant-prod-gke"
+  dbPasswordSecretId: "tenant-prod-db-password"
+  thirdPartyApiKeySecretId: "tenant-prod-third-party-api-key"
+  refreshInterval: 1m

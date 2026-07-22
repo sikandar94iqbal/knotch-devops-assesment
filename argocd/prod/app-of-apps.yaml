@@ -14,7 +14,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/REPLACE_ORG/REPLACE_REPO.git
+    repoURL: https://github.com/sikandar94iqbal/knotch-devops-assesment.git
     targetRevision: main
     path: argocd/prod/apps
   destination:

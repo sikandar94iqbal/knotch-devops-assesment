@@ -30,11 +30,12 @@ resource "google_sql_database_instance" "this" {
   depends_on = [var.private_service_access_dependency]
 
   settings {
-    tier              = var.tier
-    availability_type = var.availability_type
-    disk_size         = var.disk_size_gb
-    disk_autoresize   = true
-    disk_type         = "PD_SSD"
+    tier                  = var.tier
+    availability_type     = var.availability_type
+    disk_size             = var.disk_size_gb
+    disk_autoresize       = true
+    disk_autoresize_limit = var.disk_autoresize_limit_gb
+    disk_type             = "PD_SSD"
 
     ip_configuration {
       ipv4_enabled    = false # No public IP - private-only by construction, not firewall rule.

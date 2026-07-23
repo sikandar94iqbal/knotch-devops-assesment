@@ -51,6 +51,12 @@ variable "disk_size_gb" {
   default     = 20
 }
 
+variable "disk_autoresize_limit_gb" {
+  description = "Upper bound on automatic disk growth (0 = unlimited, the Cloud SQL default). Purely a cost/safety cap - a runaway disk-filling issue hits this limit and starts failing loudly instead of silently autoresizing (and billing) forever. Comfortable headroom over disk_size_gb for either environment's current sizing."
+  type        = number
+  default     = 200
+}
+
 variable "backup_enabled" {
   description = "Whether automated daily backups are enabled."
   type        = bool

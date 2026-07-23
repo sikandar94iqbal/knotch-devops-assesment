@@ -20,12 +20,17 @@ output "subnet_name" {
 
 output "pods_range_name" {
   description = "Name of the secondary IP range used for GKE Pods."
-  value       = google_compute_subnetwork.gke.secondary_ip_range[0].range_name
+  # Built from the same "${var.name_prefix}-pods" expression main.tf uses
+  # to name the range, rather than indexing into secondary_ip_range[0] -
+  # that indexing depended on declaration order in main.tf and would have
+  # silently swapped meaning with pods_range_name/services_range_name if
+  # those two blocks were ever reordered.
+  value = "${var.name_prefix}-pods"
 }
 
 output "services_range_name" {
   description = "Name of the secondary IP range used for GKE Services."
-  value       = google_compute_subnetwork.gke.secondary_ip_range[1].range_name
+  value       = "${var.name_prefix}-services"
 }
 
 output "private_service_access_dependency" {

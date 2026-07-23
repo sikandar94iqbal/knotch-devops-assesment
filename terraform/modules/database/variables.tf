@@ -48,13 +48,13 @@ variable "availability_type" {
 variable "disk_size_gb" {
   description = "Provisioned disk size in GB. Autoresize is enabled so this is just the starting point."
   type        = number
-  default     = 20
+  default     = 30
 }
 
 variable "disk_autoresize_limit_gb" {
   description = "Upper bound on automatic disk growth (0 = unlimited, the Cloud SQL default). Purely a cost/safety cap - a runaway disk-filling issue hits this limit and starts failing loudly instead of silently autoresizing (and billing) forever. Comfortable headroom over disk_size_gb for either environment's current sizing."
   type        = number
-  default     = 200
+  default     = 100
 }
 
 variable "backup_enabled" {

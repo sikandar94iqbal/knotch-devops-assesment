@@ -568,6 +568,20 @@ export GITHUB_REPO="REPLACE_REPO"
 export PROJECT_ID="your-dev-or-prod-gcp-project-id"   # e.g. $DEV_PROJECT_ID, then $PROD_PROJECT_ID
 export ENV_NAME="dev"                                  # or "prod"
 
+# The IAM Credentials API is what CI's WIF-based auth actually calls to
+# exchange GitHub's OIDC token for short-lived credentials as the CI
+# service account (google-github-actions/auth, and the GCS backend's own
+# auth during `terraform init`, both depend on it). It's disabled by
+# default on a brand-new project and Terraform can't bootstrap it for you
+# here: enabling it is itself a `google_project_service` resource inside
+# the Terraform this very CI identity is meant to run - so until this one
+# API is on, that identity can't authenticate at all, let alone apply
+# anything. This is the one API that has to be enabled out-of-band, before
+# CI's first ever run against a project - not a workaround, an inherent
+# bootstrapping requirement of keyless WIF auth on a project that has
+# never been touched by Terraform yet.
+gcloud services enable iamcredentials.googleapis.com --project="$PROJECT_ID"
+
 # Workload Identity Federation pool + provider, trusting GitHub Actions'
 # OIDC tokens - this is what makes CI's GCP auth keyless. A separate pool
 # per project, since pools are project-scoped resources.
@@ -683,11 +697,25 @@ terraform destroy
 Two safety nets will refuse a naive `terraform destroy` here, on purpose:
 
 - **Prod's GKE cluster and Cloud SQL instance both set
-  `deletion_protection = true`** (`terraform/environments/prod/main.tf`) -
-  a stray `terraform destroy` can't take prod down by accident. To
-  actually destroy prod: edit those two `deletion_protection` values to
-  `false`, run `terraform apply` first (this only flips the protection
-  flag, nothing else changes), *then* `terraform destroy`.
+  `deletion_protection = true`, and the third-party API key secret sets
+  `lifecycle { prevent_destroy = true }`** (all in
+  `terraform/environments/prod/main.tf`) - a stray `terraform destroy`
+  can't take prod down by accident. To actually destroy prod: flip the two
+  `deletion_protection` values and the `prevent_destroy` value to `false`,
+  run `terraform apply` first (this only flips the protection flags,
+  nothing else changes), *then* `terraform destroy`. (Only
+  `deletion_protection` actually needs the intermediate `apply` - it's a
+  real, API-backed field on those two resources. `prevent_destroy` is
+  pure Terraform-side bookkeeping with no GCP-side effect, so flipping it
+  takes effect the moment the file changes; it only needs to ride along
+  with the same `apply` for convenience, not because it requires one.)
+  The VPC, subnet, Private Service Access range, and DB password secret
+  are **not** hard-locked this way - they live in modules shared with dev,
+  and Terraform's `prevent_destroy` can't be parameterized by a variable
+  (it must be a literal), so hard-locking them would either lock dev too
+  or require an awkward resource-duplication workaround that breaks its
+  own teardown story. They're covered instead by the confirmation prompt
+  below, which requires typing the project ID back.
 - **The bootstrap stack's state bucket has `lifecycle { prevent_destroy =
   true }`** (`terraform/bootstrap/main.tf`) - it holds every environment's
   Terraform state, so an accidental destroy here is far worse than the
@@ -814,12 +842,13 @@ a choice matching [Tear it down](#tear-it-down)'s two options:
 
 **Prod-specific safety mechanism**: option 1 on `teardown-prod.sh` has to
 deliberately flip `deletion_protection` from `true` to `false` for both
-the GKE cluster and Cloud SQL instance in
+the GKE cluster and Cloud SQL instance, and `prevent_destroy` from `true`
+to `false` for the third-party API key secret, all in
 `terraform/environments/prod/main.tf`, `terraform apply` that change,
 *then* destroy - and restores `main.tf` back to `deletion_protection =
-true` afterward, so the repo is left in its normal protected-by-default
-state for next time. `teardown-dev.sh` skips all of this - dev has no
-protection flags to disable in the first place.
+true`/`prevent_destroy = true` afterward, so the repo is left in its
+normal protected-by-default state for next time. `teardown-dev.sh` skips
+all of this - dev has no protection flags to disable in the first place.
 
 **Every destructive path in both scripts requires typing the project ID
 back** (`knotch-dev`/`knotch-prod`), not just `y` - a stray Enter or a

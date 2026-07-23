@@ -58,17 +58,20 @@ case "$choice" in
   1)
     confirm_destructive "About to (a) temporarily flip
 deletion_protection from true to false for BOTH the GKE cluster and Cloud
-SQL instance in terraform/environments/prod/main.tf, (b) apply that
-change, (c) destroy every Terraform-managed resource in project
+SQL instance, and prevent_destroy from true to false for the third-party
+API key secret, all in terraform/environments/prod/main.tf, (b) apply
+that change, (c) destroy every Terraform-managed resource in project
 '$PROJECT_ID' - including the Cloud SQL instance and ALL DATA IN IT (any
-point-in-time-recovery window ends the moment the instance is gone) -
-and (d) restore deletion_protection back to true in main.tf afterward.
-Step (c) cannot be undone once it completes. This is the safety net prod
-normally has; disabling it is the entire point of running this script."
+point-in-time-recovery window ends the moment the instance is gone), plus
+the third-party API key secret with no recovery path - and (d) restore
+both flags back to true in main.tf afterward. Step (c) cannot be undone
+once it completes. This is the safety net prod normally has; disabling
+it is the entire point of running this script."
 
     cp "$MAIN_TF" "$MAIN_TF.pre-teardown.bak"
     sed -i -E 's/(deletion_protection[[:space:]]*=[[:space:]]*)true/\1false/' "$MAIN_TF"
-    echo "deletion_protection flipped to false locally. Diff:"
+    sed -i -E 's/(prevent_destroy[[:space:]]*=[[:space:]]*)true/\1false/' "$MAIN_TF"
+    echo "deletion_protection and prevent_destroy flipped to false locally. Diff:"
     git -C "$REPO_DIR" diff -- "$MAIN_TF" || true
 
     cd "$TF_DIR"
@@ -84,7 +87,7 @@ normally has; disabling it is the entire point of running this script."
     rm -f prod-destroy.tfplan
     echo "Destroy complete."
 
-    echo "Restoring deletion_protection = true in main.tf..."
+    echo "Restoring deletion_protection and prevent_destroy = true in main.tf..."
     mv "$MAIN_TF.pre-teardown.bak" "$MAIN_TF"
     git -C "$REPO_DIR" diff -- "$MAIN_TF" || true
     echo

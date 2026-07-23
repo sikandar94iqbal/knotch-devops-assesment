@@ -93,6 +93,7 @@ jobs:
           echo "DB_HOST=$(terraform output -raw database_private_ip)" >> "$GITHUB_ENV"
           echo "SECURITY_POLICY=$(terraform output -raw security_policy_name)" >> "$GITHUB_ENV"
           echo "CERT_MAP_NAME=$(terraform output -raw certificate_map_name)" >> "$GITHUB_ENV"
+          echo "CLUSTER_NAME_OUTPUT=$(terraform output -raw cluster_name)" >> "$GITHUB_ENV"
           echo "ARGOCD_URL=$(terraform output -raw argocd_url)" >> "$GITHUB_ENV"
 
       - name: Wait for ArgoCD's Gateway to get an external IP
@@ -121,6 +122,7 @@ jobs:
             -e "s|^([[:space:]]*gcpServiceAccountEmail: ).*|\1\"${APP_SA_EMAIL}\"|" \
             -e "s|^([[:space:]]*host: ).*|\1\"${DB_HOST}\"|" \
             -e "s|^([[:space:]]*gcpProjectId: ).*|\1\"${PROJECT_ID}\"|" \
+            -e "s|^([[:space:]]*clusterName: ).*|\1\"${CLUSTER_NAME_OUTPUT}\"|" \
             "$VALUES_FILE"
           echo "Diff:"
           git diff -- "$VALUES_FILE" || true
@@ -243,6 +245,7 @@ jobs:
           echo "DB_HOST=$(terraform output -raw database_private_ip)" >> "$GITHUB_ENV"
           echo "SECURITY_POLICY=$(terraform output -raw security_policy_name)" >> "$GITHUB_ENV"
           echo "CERT_MAP_NAME=$(terraform output -raw certificate_map_name)" >> "$GITHUB_ENV"
+          echo "CLUSTER_NAME_OUTPUT=$(terraform output -raw cluster_name)" >> "$GITHUB_ENV"
           echo "ARGOCD_URL=$(terraform output -raw argocd_url)" >> "$GITHUB_ENV"
 
       - name: Wait for ArgoCD's Gateway to get an external IP
@@ -271,6 +274,7 @@ jobs:
             -e "s|^([[:space:]]*gcpServiceAccountEmail: ).*|\1\"${APP_SA_EMAIL}\"|" \
             -e "s|^([[:space:]]*host: ).*|\1\"${DB_HOST}\"|" \
             -e "s|^([[:space:]]*gcpProjectId: ).*|\1\"${PROJECT_ID}\"|" \
+            -e "s|^([[:space:]]*clusterName: ).*|\1\"${CLUSTER_NAME_OUTPUT}\"|" \
             "$VALUES_FILE"
           echo "Diff:"
           git diff -- "$VALUES_FILE" || true

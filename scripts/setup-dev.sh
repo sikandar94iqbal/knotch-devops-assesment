@@ -141,6 +141,7 @@ APP_SA_EMAIL="$(terraform output -raw app_service_account_email)"
 DB_HOST="$(terraform output -raw database_private_ip)"
 SECURITY_POLICY="$(terraform output -raw security_policy_name)"
 CERT_MAP_NAME="$(terraform output -raw certificate_map_name)"
+CLUSTER_NAME_OUTPUT="$(terraform output -raw cluster_name)"
 ARGOCD_URL="$(terraform output -raw argocd_url)"
 
 echo
@@ -148,6 +149,7 @@ echo "App service account:    $APP_SA_EMAIL"
 echo "Database private IP:    $DB_HOST"
 echo "Cloud Armor policy:     $SECURITY_POLICY"
 echo "Certificate map:        $CERT_MAP_NAME"
+echo "Cluster name:           $CLUSTER_NAME_OUTPUT"
 echo "ArgoCD URL:             $ARGOCD_URL"
 
 # --- Step 3: ArgoCD admin credentials + Gateway IP ---------------------------
@@ -179,13 +181,14 @@ section "Step 4: Update helm/api-service/values-dev.yaml with real values"
 
 confirm "Edits $VALUES_FILE in place, setting gateway.hostname,
 gateway.certificateMapName, cloudArmor.securityPolicyName,
-serviceAccount.gcpServiceAccountEmail, database.host, and
-externalSecrets.gcpProjectId to the real values fetched above - by YAML
-key, not by matching leftover placeholder text, so this stays correct
-even on a re-run after the underlying infra changed (e.g. Cloud SQL's
-private IP is reassigned after a destroy+recreate). Only touches these
-six keys' values - nothing else in the file changes. Review the diff
-printed after this step before committing."
+serviceAccount.gcpServiceAccountEmail, database.host,
+externalSecrets.gcpProjectId, and externalSecrets.clusterName to the real
+values fetched above - by YAML key, not by matching leftover placeholder
+text, so this stays correct even on a re-run after the underlying infra
+changed (e.g. Cloud SQL's private IP is reassigned after a
+destroy+recreate). Only touches these seven keys' values - nothing else
+in the file changes. Review the diff printed after this step before
+committing."
 
 sed -i.bak -E \
   -e "s|^([[:space:]]*hostname: ).*|\1\"${APP_HOSTNAME}\"|" \
@@ -194,6 +197,7 @@ sed -i.bak -E \
   -e "s|^([[:space:]]*gcpServiceAccountEmail: ).*|\1\"${APP_SA_EMAIL}\"|" \
   -e "s|^([[:space:]]*host: ).*|\1\"${DB_HOST}\"|" \
   -e "s|^([[:space:]]*gcpProjectId: ).*|\1\"${PROJECT_ID}\"|" \
+  -e "s|^([[:space:]]*clusterName: ).*|\1\"${CLUSTER_NAME_OUTPUT}\"|" \
   "$VALUES_FILE"
 rm -f "$VALUES_FILE.bak"
 

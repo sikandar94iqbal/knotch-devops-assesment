@@ -531,15 +531,36 @@ for e in dev prod; do ENV="$e" ./scripts/test-db-connection.sh; done
 
 It reads `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER` straight off the live
 Deployment and the password straight off the Secret ESO synced from
-Secret Manager, then runs two checks from a short-lived debug Pod in the
-same namespace (so it takes the exact same network path a real app Pod
-does), cleaning up after itself either way:
+Secret Manager, then runs two checks as an **ephemeral debug container
+attached to a real, currently running app Pod** (`kubectl debug`) - not a
+standalone bystander Pod. That distinction is deliberate: the app's
+`NetworkPolicy` scopes its egress rule to Pods carrying the app's own
+selector labels; a plain `kubectl run` Pod doesn't carry those labels, so
+it wouldn't actually be governed by that NetworkPolicy at all, and could
+pass even if the egress rule were broken. Attaching to the real Pod shares
+its network namespace, so the test is subject to the exact same
+NetworkPolicy enforcement a real request from the app would be:
 
 1. **`pg_isready`** - TCP-level reachability, proving the private IP is
-   actually routable from inside the VPC, independent of credentials.
+   actually routable from inside the VPC *through the app's own
+   NetworkPolicy egress rule*, independent of credentials.
 2. **`psql -c "SELECT 1"`** - an authenticated query, proving the
    password ESO delivered is correct and Cloud SQL accepts the connection
    over TLS.
+
+The debug container runs as root, overriding the Pod's own non-root
+`securityContext` for just that one throwaway container -
+`postgres:16-alpine`'s client tools call `getpwuid()` to resolve the
+current user's home directory, which fails (and aborts the client before
+it even attempts the connection) for an arbitrary UID with no
+`/etc/passwd` entry. This doesn't touch the real app container's security
+posture at all - it's a separate, temporary container.
+
+**Known limitation**: Kubernetes has no way to remove an ephemeral
+container once added - it stays listed (terminated, zero resource cost)
+in the Pod's spec until that Pod is next replaced by a normal rollout or
+scaling event. Harmless, just not self-cleaning the way a `kubectl run
+--rm` Pod would be.
 
 Confirmed against the live dev environment: `pg_isready` returned
 `172.26.0.3:5432 - accepting connections`, and the query returned `1` -
@@ -611,6 +632,25 @@ for role in roles/container.admin roles/compute.networkAdmin \
     --role="$role"
 done
 
+# Pools and the default Compute Engine SA are addressed by project NUMBER
+# here, not project ID - resolve it once, used by both steps below.
+export PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+
+# GKE Autopilot nodes run under the project's default Compute Engine
+# service account unless a custom node SA is configured. Creating (or
+# recreating) the cluster means Terraform attaches that SA to the nodes,
+# which GCP treats as an "actAs" operation - it requires
+# roles/iam.serviceAccountUser on that *specific* SA, not just broad
+# project roles. This one only surfaces the first time CI actually
+# creates a GKE cluster from scratch (a local `terraform apply` under your
+# own, effectively-Owner account never hits it), so it's easy to miss
+# until then.
+gcloud iam service-accounts add-iam-policy-binding \
+  "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --project="$PROJECT_ID" \
+  --role="roles/iam.serviceAccountUser" \
+  --member="serviceAccount:tenant-platform-ci-${ENV_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
 # Grant access to THIS project's own state bucket only (from step 1) -
 # never the other environment's bucket, which lives in the other project.
 gcloud storage buckets add-iam-policy-binding "gs://your-org-tenant-${ENV_NAME}-tfstate" \
@@ -618,9 +658,6 @@ gcloud storage buckets add-iam-policy-binding "gs://your-org-tenant-${ENV_NAME}-
   --role="roles/storage.objectAdmin"
 
 # Let GitHub's OIDC token impersonate this project's CI service account.
-# Pools are addressed by project NUMBER here, not project ID - resolve it first.
-export PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-
 gcloud iam service-accounts add-iam-policy-binding \
   "tenant-platform-ci-${ENV_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
   --role="roles/iam.workloadIdentityUser" \
@@ -648,6 +685,39 @@ Actions workflow instead of a local `terraform apply` - see
 [End-to-end GitOps workflow](#end-to-end-gitops-workflow) for the full
 steady-state picture (infra changes via CI, app changes via ArgoCD,
 already true as of step 4/Path B above).
+
+#### After the first-ever `terraform apply` for an environment: bootstrap it via CI too
+
+`.github/workflows/bootstrap-environment.yaml` does everything
+`scripts/setup-{dev,prod}.sh` does *after* the Terraform step - fetch
+outputs, fill in the Helm values file, add a placeholder third-party-secret
+version, commit + push, apply `app-of-apps.yaml`, wait for sync, and print
+the ArgoCD/app URLs - as a `workflow_dispatch` you trigger manually from
+the **Actions** tab (pick the workflow, "Run workflow," choose `dev` or
+`prod`).
+
+It's a **separate workflow, not folded into the routine plan/apply
+pipeline**, on purpose: some of these steps are only safe to run *once*.
+Re-adding a secret version on every merge to `main` would silently
+overwrite a real third-party API key with the placeholder the moment
+you'd actually set one - so this only runs when you explicitly ask it to,
+typically once per environment, right after that environment's first
+`terraform apply` succeeds.
+
+It reuses the same `dev`/`prod` GitHub Environments as the plan/apply
+workflow - so `bootstrap-prod` pauses for your approval too, the same
+required-reviewer gate, no separate setup needed.
+
+One deliberate difference from the local scripts: this workflow **never
+reads or prints the ArgoCD admin password** - Actions run logs on a public
+repo are publicly viewable, unlike your own terminal. The summary tells
+you the `kubectl` command to fetch it yourself instead.
+
+It also skips `setup-*.sh`'s "connect repo to ArgoCD" step entirely -
+this repo is public, so ArgoCD needs no stored git credentials to clone
+it at all. (If this repo were ever made private, that step would need to
+come back as a registered, PAT-backed Kubernetes Secret - the interactive
+prompt in the local scripts, or a stored repo secret for CI.)
 
 ---
 
@@ -801,14 +871,16 @@ usage and exits. Proves the private Pod -> VPC -> Private Service Access
 -> Cloud SQL path actually works, using the app's own real, live config
 (read directly off the Deployment and Secret in that environment's
 namespace - never a value from a file on disk, which could be stale).
-Runs two short-lived debug Pods (`pg_isready`, then an authenticated
-`SELECT 1`) in the same namespace as the app, so the test takes the exact
-same network path a real app Pod does, and cleans up after itself either
-way.
+Runs two checks (`pg_isready`, then an authenticated `SELECT 1`) as an
+**ephemeral debug container attached to a real, currently running app
+Pod** (`kubectl debug`, not `kubectl run`) - so the test rides that Pod's
+actual network namespace and is genuinely subject to its `NetworkPolicy`
+egress rule, not bypassing it via an unselected bystander Pod.
 
 **Limitations**:
 - Requires the app to already be deployed in that environment (reads its
-  Deployment/Secret) - fails with a clear error if not, rather than a
+  Deployment/Secret, and needs at least one Running Pod matching the
+  app's selector labels) - fails with a clear error if not, rather than a
   confusing Kubernetes error.
 - Requires `kubectl` to already be pointed at the right cluster (`gcloud
   container clusters get-credentials tenant-{dev,prod}-gke ...` first) -
@@ -823,6 +895,17 @@ way.
   values, the positional argument silently wins - there's no warning,
   since a script accepting two ways to say the same thing is expected to
   pick a deterministic order, not fail.
+- **Ephemeral containers can't be removed** once attached - each run
+  leaves a terminated (zero resource cost) container entry on whichever
+  app Pod it happened to pick, visible in `kubectl describe pod`, until
+  that Pod is next replaced by a rollout or scaling event. Not a leak,
+  just not self-cleaning the way the previous `kubectl run --rm` approach
+  was.
+- The debug container runs as **root**, overriding the Pod's own
+  non-root `securityContext` for that one throwaway container only -
+  `postgres:16-alpine`'s client tools abort before even attempting the
+  connection when run as an arbitrary UID with no `/etc/passwd` entry
+  (`getpwuid()` fails). This never touches the real app container.
 
 ### `teardown-dev.sh` / `teardown-prod.sh`
 

@@ -1,0 +1,331 @@
+name: Bootstrap Environment
+
+# Manually triggered, once per environment, right after that environment's
+# first-ever `terraform apply` has succeeded (see terraform.yaml). Does
+# everything scripts/setup-{dev,prod}.sh does AFTER the terraform apply
+# step: fetch outputs, fill in the Helm values file, add a placeholder
+# third-party-secret version (only if the secret currently has zero
+# versions), commit + push, apply app-of-apps.yaml, wait for the app to
+# sync, and print the ArgoCD/app URLs to the run summary.
+#
+# Deliberately NOT part of the routine plan/apply pipeline in terraform.yaml.
+# Some of these steps are only safe to run once - re-adding a secret
+# version on every merge to main would silently overwrite a real
+# third-party API key with the placeholder the moment you'd set one for
+# real. Re-run this workflow by hand again later only if you actually want
+# to re-sync the values file from fresh terraform outputs.
+#
+# This repo is public, so ArgoCD needs no stored git credentials to clone
+# it - that's why there's no equivalent of setup-*.sh's "Step 7: connect
+# repo" here. If this repo is ever made private, that step would need to
+# come back, as a registered PAT-backed Kubernetes Secret.
+#
+# The ArgoCD admin password is deliberately never read or printed by this
+# workflow - Actions run logs on a public repo are publicly viewable, so
+# unlike the local scripts (private terminal), this prints only the
+# `kubectl` command to fetch it yourself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to bootstrap (must already have a successful terraform apply)"
+        type: choice
+        options:
+          - dev
+          - prod
+        required: true
+
+permissions:
+  contents: write # this workflow commits the filled-in values file back to main
+  id-token: write # required to mint the OIDC token WIF exchanges for GCP creds
+
+env:
+  TF_VERSION: "1.5.7"
+
+jobs:
+  bootstrap-dev:
+    if: inputs.environment == 'dev'
+    name: bootstrap (dev)
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      PROJECT_ID: knotch-dev
+      REGION: us-central1
+      CLUSTER_NAME: tenant-dev-gke
+      APP_NAME: knotch-demo-app-dev
+      APP_HOSTNAME: api-dev.tenant.internal
+      ARGOCD_HOSTNAME: argocd-dev.tenant.internal
+      THIRD_PARTY_SECRET_ID: tenant-dev-third-party-api-key
+      VALUES_FILE: helm/api-service/values-dev.yaml
+      TF_DIR: terraform/environments/dev
+    steps:
+      - name: Authenticate to the DEV GCP project via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.DEV_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.DEV_CI_SERVICE_ACCOUNT }}
+
+      - uses: actions/checkout@v4
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Read Terraform outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "APP_SA_EMAIL=$(terraform output -raw app_service_account_email)" >> "$GITHUB_ENV"
+          echo "DB_HOST=$(terraform output -raw database_private_ip)" >> "$GITHUB_ENV"
+          echo "SECURITY_POLICY=$(terraform output -raw security_policy_name)" >> "$GITHUB_ENV"
+          echo "ARGOCD_URL=$(terraform output -raw argocd_url)" >> "$GITHUB_ENV"
+
+      - name: Wait for ArgoCD's Gateway to get an external IP
+        run: |
+          for i in $(seq 1 30); do
+            IP="$(kubectl get gateway argocd-gateway -n argocd -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || true)"
+            if [ -n "$IP" ]; then
+              echo "ARGOCD_GATEWAY_IP=$IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for ArgoCD's Gateway IP."
+          exit 1
+
+      - name: Fill in the Helm values file with real Terraform outputs
+        run: |
+          sed -i \
+            -e "s|api\.REPLACE_WITH_DOMAIN\.com|${APP_HOSTNAME}|" \
+            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_security_policy_name|${SECURITY_POLICY}|" \
+            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_app_service_account_email|${APP_SA_EMAIL}|" \
+            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_database_private_ip|${DB_HOST}|" \
+            -e "s|REPLACE_WITH_GCP_PROJECT_ID|${PROJECT_ID}|" \
+            "$VALUES_FILE"
+          echo "Diff:"
+          git diff -- "$VALUES_FILE" || true
+
+      - name: Add a placeholder third-party API key secret version (only if empty)
+        run: |
+          COUNT="$(gcloud secrets versions list "$THIRD_PARTY_SECRET_ID" --project "$PROJECT_ID" --format='value(name)' | wc -l | tr -d ' ')"
+          if [ "$COUNT" = "0" ]; then
+            echo -n "demo-placeholder-value-replace-with-a-real-key-later" | \
+              gcloud secrets versions add "$THIRD_PARTY_SECRET_ID" --data-file=- --project "$PROJECT_ID"
+            echo "Added a placeholder version - $THIRD_PARTY_SECRET_ID had none yet."
+          else
+            echo "$THIRD_PARTY_SECRET_ID already has $COUNT version(s) - leaving it alone (not overwriting a real key)."
+          fi
+
+      - name: Commit and push the filled-in values file, if it changed
+        run: |
+          if git diff --quiet -- "$VALUES_FILE"; then
+            echo "No changes to $VALUES_FILE - already filled in."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$VALUES_FILE"
+            git commit -m "Fill in ${{ inputs.environment }} Helm values from terraform output"
+            git push
+          fi
+
+      - name: Apply app-of-apps.yaml
+        run: kubectl apply -f "argocd/${{ inputs.environment }}/app-of-apps.yaml"
+
+      - name: Wait for the Application to sync
+        run: |
+          for i in $(seq 1 30); do
+            STATUS="$(kubectl get application "$APP_NAME" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+            if [ "$STATUS" = "Synced" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for $APP_NAME to sync."
+          exit 1
+
+      - name: Wait for the app's own Gateway to get an external IP
+        run: |
+          GATEWAY_NAME="${APP_NAME}-api-service"
+          for i in $(seq 1 30); do
+            IP="$(kubectl get gateway "$GATEWAY_NAME" -n "tenant-${{ inputs.environment }}" -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || true)"
+            if [ -n "$IP" ]; then
+              echo "APP_GATEWAY_IP=$IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for the app's Gateway IP."
+          exit 1
+
+      - name: Print summary
+        run: |
+          {
+            echo "## Bootstrap complete: ${{ inputs.environment }}"
+            echo
+            echo "| | URL | IP |"
+            echo "|---|---|---|"
+            echo "| ArgoCD | $ARGOCD_URL | $ARGOCD_GATEWAY_IP |"
+            echo "| App | https://${APP_HOSTNAME}/ | $APP_GATEWAY_IP |"
+            echo
+            echo "Add both to \`/etc/hosts\` to browse them:"
+            echo '```'
+            echo "$ARGOCD_GATEWAY_IP  $ARGOCD_HOSTNAME"
+            echo "$APP_GATEWAY_IP  $APP_HOSTNAME"
+            echo '```'
+            echo
+            echo "ArgoCD admin password is deliberately not printed here (public repo, public logs)."
+            echo "Fetch it yourself: \`kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bootstrap-prod:
+    if: inputs.environment == 'prod'
+    name: bootstrap (prod)
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      PROJECT_ID: knotch-prod
+      REGION: us-central1
+      CLUSTER_NAME: tenant-prod-gke
+      APP_NAME: knotch-demo-app-prod
+      APP_HOSTNAME: api-prod.tenant.internal
+      ARGOCD_HOSTNAME: argocd-prod.tenant.internal
+      THIRD_PARTY_SECRET_ID: tenant-prod-third-party-api-key
+      VALUES_FILE: helm/api-service/values-prod.yaml
+      TF_DIR: terraform/environments/prod
+    steps:
+      - name: Authenticate to the PROD GCP project via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.PROD_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.PROD_CI_SERVICE_ACCOUNT }}
+
+      - uses: actions/checkout@v4
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Read Terraform outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "APP_SA_EMAIL=$(terraform output -raw app_service_account_email)" >> "$GITHUB_ENV"
+          echo "DB_HOST=$(terraform output -raw database_private_ip)" >> "$GITHUB_ENV"
+          echo "SECURITY_POLICY=$(terraform output -raw security_policy_name)" >> "$GITHUB_ENV"
+          echo "ARGOCD_URL=$(terraform output -raw argocd_url)" >> "$GITHUB_ENV"
+
+      - name: Wait for ArgoCD's Gateway to get an external IP
+        run: |
+          for i in $(seq 1 30); do
+            IP="$(kubectl get gateway argocd-gateway -n argocd -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || true)"
+            if [ -n "$IP" ]; then
+              echo "ARGOCD_GATEWAY_IP=$IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for ArgoCD's Gateway IP."
+          exit 1
+
+      - name: Fill in the Helm values file with real Terraform outputs
+        run: |
+          sed -i \
+            -e "s|api\.REPLACE_WITH_DOMAIN\.com|${APP_HOSTNAME}|" \
+            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_security_policy_name|${SECURITY_POLICY}|" \
+            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_app_service_account_email|${APP_SA_EMAIL}|" \
+            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_database_private_ip|${DB_HOST}|" \
+            -e "s|REPLACE_WITH_GCP_PROJECT_ID|${PROJECT_ID}|" \
+            "$VALUES_FILE"
+          echo "Diff:"
+          git diff -- "$VALUES_FILE" || true
+
+      - name: Add a placeholder third-party API key secret version (only if empty)
+        run: |
+          COUNT="$(gcloud secrets versions list "$THIRD_PARTY_SECRET_ID" --project "$PROJECT_ID" --format='value(name)' | wc -l | tr -d ' ')"
+          if [ "$COUNT" = "0" ]; then
+            echo -n "demo-placeholder-value-replace-with-a-real-key-later" | \
+              gcloud secrets versions add "$THIRD_PARTY_SECRET_ID" --data-file=- --project "$PROJECT_ID"
+            echo "Added a placeholder version - $THIRD_PARTY_SECRET_ID had none yet."
+          else
+            echo "$THIRD_PARTY_SECRET_ID already has $COUNT version(s) - leaving it alone (not overwriting a real key)."
+          fi
+
+      - name: Commit and push the filled-in values file, if it changed
+        run: |
+          if git diff --quiet -- "$VALUES_FILE"; then
+            echo "No changes to $VALUES_FILE - already filled in."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$VALUES_FILE"
+            git commit -m "Fill in ${{ inputs.environment }} Helm values from terraform output"
+            git push
+          fi
+
+      - name: Apply app-of-apps.yaml
+        run: kubectl apply -f "argocd/${{ inputs.environment }}/app-of-apps.yaml"
+
+      - name: Wait for the Application to sync
+        run: |
+          for i in $(seq 1 30); do
+            STATUS="$(kubectl get application "$APP_NAME" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null || true)"
+            if [ "$STATUS" = "Synced" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for $APP_NAME to sync."
+          exit 1
+
+      - name: Wait for the app's own Gateway to get an external IP
+        run: |
+          GATEWAY_NAME="${APP_NAME}-api-service"
+          for i in $(seq 1 30); do
+            IP="$(kubectl get gateway "$GATEWAY_NAME" -n "tenant-${{ inputs.environment }}" -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || true)"
+            if [ -n "$IP" ]; then
+              echo "APP_GATEWAY_IP=$IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for the app's Gateway IP."
+          exit 1
+
+      - name: Print summary
+        run: |
+          {
+            echo "## Bootstrap complete: ${{ inputs.environment }}"
+            echo
+            echo "| | URL | IP |"
+            echo "|---|---|---|"
+            echo "| ArgoCD | $ARGOCD_URL | $ARGOCD_GATEWAY_IP |"
+            echo "| App | https://${APP_HOSTNAME}/ | $APP_GATEWAY_IP |"
+            echo
+            echo "Add both to \`/etc/hosts\` to browse them:"
+            echo '```'
+            echo "$ARGOCD_GATEWAY_IP  $ARGOCD_HOSTNAME"
+            echo "$APP_GATEWAY_IP  $APP_HOSTNAME"
+            echo '```'
+            echo
+            echo "ArgoCD admin password is deliberately not printed here (public repo, public logs)."
+            echo "Fetch it yourself: \`kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d\`"
+          } >> "$GITHUB_STEP_SUMMARY"

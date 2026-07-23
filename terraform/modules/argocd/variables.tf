@@ -20,7 +20,7 @@ variable "certificate_map_name" {
 }
 
 variable "security_policy_name" {
-  description = "Cloud Armor security policy name (from the security module) attached to argocd-server via GCPBackendPolicy - the same policy protecting the app, so ArgoCD's admin UI gets the identical WAF/rate-limit coverage, not a weaker exception."
+  description = "Cloud Armor security policy name (from the security module) attached to argocd-server via GCPBackendPolicy - the same policy protecting the app, so ArgoCD's admin UI gets identical coverage, not a weaker exception."
   type        = string
 }
 

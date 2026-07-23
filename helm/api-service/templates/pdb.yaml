@@ -5,6 +5,9 @@ metadata:
   labels:
     {{- include "api-service.labels" . | nindent 4 }}
 spec:
+  # Assumes autoscaling.minReplicas stays >= 2 (true in both values-dev.yaml
+  # and values-prod.yaml) - if minReplicas ever dropped to 1, minAvailable:1
+  # would block every voluntary disruption (0 Pods left evictable).
   minAvailable: {{ .Values.pdb.minAvailable }}
   selector:
     matchLabels:

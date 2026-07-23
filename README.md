@@ -225,9 +225,14 @@ way the first attempt was.
 │   ├── dev/                    # app-of-apps.yaml + apps/api.yaml - dev cluster's ArgoCD only
 │   └── prod/                   # app-of-apps.yaml + apps/api.yaml - prod cluster's ArgoCD only
 ├── scripts/
-│   ├── setup-prod.sh           # provisions prod end-to-end, confirms impact before every change
-│   └── test-db-connection.sh   # proves the private Pod -> VPC -> Cloud SQL path actually works
-├── .github/workflows/          # terraform.yaml - plan on PR, apply on merge
+│   ├── setup-dev.sh            # provisions dev end-to-end, confirms impact before every change
+│   ├── setup-prod.sh           # same, for prod
+│   ├── test-db-connection.sh   # proves the private Pod -> VPC -> Cloud SQL path actually works
+│   ├── teardown-dev.sh         # tears dev down, confirms before every destructive step
+│   └── teardown-prod.sh        # same, for prod - plus the deletion_protection flip/restore dance
+├── .github/workflows/
+│   ├── terraform.yaml               # plan on PR, apply on merge
+│   └── bootstrap-environment.yaml   # manual, one-time per environment: post-apply setup, prints URLs
 └── docs/architecture.dot       # Graphviz source for the diagram above
 ```
 
@@ -809,11 +814,14 @@ needed beyond the deletion-protection overrides above.
 
 ## Automation scripts
 
-All four live in `scripts/`, are `chmod +x` already, and share the same
+All five live in `scripts/`, are `chmod +x` already, and share the same
 pattern: plain `bash` (no dependencies beyond `terraform`/`kubectl`/
 `gcloud`/`git`, all already required), every destructive or infra-changing
 step prints an `IMPACT:` block and waits for confirmation before doing
 anything, and every step is idempotent - safe to re-run if interrupted.
+(The CI-side equivalent of the post-apply portion of `setup-{dev,prod}.sh`
+is `.github/workflows/bootstrap-environment.yaml` - see
+[After the first-ever terraform apply](#after-the-first-ever-terraform-apply-for-an-environment-bootstrap-it-via-ci-too).)
 
 ### `setup-dev.sh` / `setup-prod.sh`
 

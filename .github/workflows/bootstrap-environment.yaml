@@ -60,13 +60,17 @@ jobs:
       VALUES_FILE: helm/api-service/values-dev.yaml
       TF_DIR: terraform/environments/dev
     steps:
+      - uses: actions/checkout@v4
+
+      # Must come after checkout - this writes a credentials file into the
+      # workspace directory, which `actions/checkout` would otherwise wipe
+      # if it ran afterward (confirmed: that ordering bug is exactly what
+      # broke the first run of this job).
       - name: Authenticate to the DEV GCP project via Workload Identity Federation
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.DEV_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.DEV_CI_SERVICE_ACCOUNT }}
-
-      - uses: actions/checkout@v4
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2
@@ -203,13 +207,14 @@ jobs:
       VALUES_FILE: helm/api-service/values-prod.yaml
       TF_DIR: terraform/environments/prod
     steps:
+      - uses: actions/checkout@v4
+
+      # Must come after checkout - see the identical comment in bootstrap-dev.
       - name: Authenticate to the PROD GCP project via Workload Identity Federation
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.PROD_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.PROD_CI_SERVICE_ACCOUNT }}
-
-      - uses: actions/checkout@v4
 
       - name: Get GKE credentials
         uses: google-github-actions/get-gke-credentials@v2

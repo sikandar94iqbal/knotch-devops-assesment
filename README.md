@@ -581,13 +581,15 @@ architecture decisions recorded in `CLAUDE.md`.
   three stacks; `helm lint`/`helm template` clean for both value files;
   `scripts/test-db-connection.sh` run and passing against both live
   environments.
-- **Who ran what**: the assistant executed a substantial number of
-  `gcloud`/`kubectl`/`terraform` commands directly against the live
-  `knotch-dev` and `knotch-prod` projects during this build (with the
-  repo owner present and confirming destructive/impactful steps) -
-  including the original applies, live debugging, and the DB connectivity
-  tests. Prod's very first `terraform apply` was explicitly run by the
-  repo owner themselves, by request.
+- **Who ran what**: the majority of the hands-on cloud work - provisioning,
+  most `terraform apply`/`gcloud`/`kubectl` runs, and driving both
+  `knotch-dev` and `knotch-prod` end to end - was done by the repo owner
+  themselves. The assistant's role in the live environment was mainly
+  diagnosing issues from real output the owner provided (logs, error
+  messages, screenshots) and making targeted code/config changes, which
+  the owner then reviewed and approved before anything was applied again.
+  Prod's very first `terraform apply` was explicitly run by the repo owner
+  themselves, by request.
 
 ---
 

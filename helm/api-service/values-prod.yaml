@@ -22,22 +22,22 @@ pdb:
   minAvailable: 2
 
 gateway:
-  hostname: "api.REPLACE_WITH_DOMAIN.com"
+  hostname: "api-prod.tenant.internal"
   certificateMapName: "tenant-prod-certmap"
 
 cloudArmor:
-  securityPolicyName: "REPLACE_WITH_TERRAFORM_OUTPUT_security_policy_name"
+  securityPolicyName: "tenant-prod-armor-policy"
 
 serviceAccount:
-  gcpServiceAccountEmail: "REPLACE_WITH_TERRAFORM_OUTPUT_app_service_account_email"
+  gcpServiceAccountEmail: "tenant-prod-app-sa@knotch-prod.iam.gserviceaccount.com"
 
 database:
-  host: "REPLACE_WITH_TERRAFORM_OUTPUT_database_private_ip"
+  host: "10.162.0.2"
   name: appdb
   user: appuser
 
 externalSecrets:
-  gcpProjectId: "REPLACE_WITH_GCP_PROJECT_ID"
+  gcpProjectId: "knotch-prod"
   gcpRegion: us-central1
   clusterName: "tenant-prod-gke"
   dbPasswordSecretId: "tenant-prod-db-password"

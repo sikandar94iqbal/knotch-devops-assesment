@@ -92,6 +92,7 @@ jobs:
           echo "APP_SA_EMAIL=$(terraform output -raw app_service_account_email)" >> "$GITHUB_ENV"
           echo "DB_HOST=$(terraform output -raw database_private_ip)" >> "$GITHUB_ENV"
           echo "SECURITY_POLICY=$(terraform output -raw security_policy_name)" >> "$GITHUB_ENV"
+          echo "CERT_MAP_NAME=$(terraform output -raw certificate_map_name)" >> "$GITHUB_ENV"
           echo "ARGOCD_URL=$(terraform output -raw argocd_url)" >> "$GITHUB_ENV"
 
       - name: Wait for ArgoCD's Gateway to get an external IP
@@ -109,12 +110,17 @@ jobs:
 
       - name: Fill in the Helm values file with real Terraform outputs
         run: |
-          sed -i \
-            -e "s|api\.REPLACE_WITH_DOMAIN\.com|${APP_HOSTNAME}|" \
-            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_security_policy_name|${SECURITY_POLICY}|" \
-            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_app_service_account_email|${APP_SA_EMAIL}|" \
-            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_database_private_ip|${DB_HOST}|" \
-            -e "s|REPLACE_WITH_GCP_PROJECT_ID|${PROJECT_ID}|" \
+          # Matches by YAML key, not by leftover placeholder text - stays
+          # correct on a re-run after the underlying infra changed (e.g.
+          # Cloud SQL's private IP is reassigned after a destroy+recreate),
+          # not just on the very first bootstrap.
+          sed -i -E \
+            -e "s|^([[:space:]]*hostname: ).*|\1\"${APP_HOSTNAME}\"|" \
+            -e "s|^([[:space:]]*certificateMapName: ).*|\1\"${CERT_MAP_NAME}\"|" \
+            -e "s|^([[:space:]]*securityPolicyName: ).*|\1\"${SECURITY_POLICY}\"|" \
+            -e "s|^([[:space:]]*gcpServiceAccountEmail: ).*|\1\"${APP_SA_EMAIL}\"|" \
+            -e "s|^([[:space:]]*host: ).*|\1\"${DB_HOST}\"|" \
+            -e "s|^([[:space:]]*gcpProjectId: ).*|\1\"${PROJECT_ID}\"|" \
             "$VALUES_FILE"
           echo "Diff:"
           git diff -- "$VALUES_FILE" || true
@@ -236,6 +242,7 @@ jobs:
           echo "APP_SA_EMAIL=$(terraform output -raw app_service_account_email)" >> "$GITHUB_ENV"
           echo "DB_HOST=$(terraform output -raw database_private_ip)" >> "$GITHUB_ENV"
           echo "SECURITY_POLICY=$(terraform output -raw security_policy_name)" >> "$GITHUB_ENV"
+          echo "CERT_MAP_NAME=$(terraform output -raw certificate_map_name)" >> "$GITHUB_ENV"
           echo "ARGOCD_URL=$(terraform output -raw argocd_url)" >> "$GITHUB_ENV"
 
       - name: Wait for ArgoCD's Gateway to get an external IP
@@ -253,12 +260,17 @@ jobs:
 
       - name: Fill in the Helm values file with real Terraform outputs
         run: |
-          sed -i \
-            -e "s|api\.REPLACE_WITH_DOMAIN\.com|${APP_HOSTNAME}|" \
-            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_security_policy_name|${SECURITY_POLICY}|" \
-            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_app_service_account_email|${APP_SA_EMAIL}|" \
-            -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_database_private_ip|${DB_HOST}|" \
-            -e "s|REPLACE_WITH_GCP_PROJECT_ID|${PROJECT_ID}|" \
+          # Matches by YAML key, not by leftover placeholder text - stays
+          # correct on a re-run after the underlying infra changed (e.g.
+          # Cloud SQL's private IP is reassigned after a destroy+recreate),
+          # not just on the very first bootstrap.
+          sed -i -E \
+            -e "s|^([[:space:]]*hostname: ).*|\1\"${APP_HOSTNAME}\"|" \
+            -e "s|^([[:space:]]*certificateMapName: ).*|\1\"${CERT_MAP_NAME}\"|" \
+            -e "s|^([[:space:]]*securityPolicyName: ).*|\1\"${SECURITY_POLICY}\"|" \
+            -e "s|^([[:space:]]*gcpServiceAccountEmail: ).*|\1\"${APP_SA_EMAIL}\"|" \
+            -e "s|^([[:space:]]*host: ).*|\1\"${DB_HOST}\"|" \
+            -e "s|^([[:space:]]*gcpProjectId: ).*|\1\"${PROJECT_ID}\"|" \
             "$VALUES_FILE"
           echo "Diff:"
           git diff -- "$VALUES_FILE" || true

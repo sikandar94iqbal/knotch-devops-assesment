@@ -137,12 +137,14 @@ terraform output
 APP_SA_EMAIL="$(terraform output -raw app_service_account_email)"
 DB_HOST="$(terraform output -raw database_private_ip)"
 SECURITY_POLICY="$(terraform output -raw security_policy_name)"
+CERT_MAP_NAME="$(terraform output -raw certificate_map_name)"
 ARGOCD_URL="$(terraform output -raw argocd_url)"
 
 echo
 echo "App service account:    $APP_SA_EMAIL"
 echo "Database private IP:    $DB_HOST"
 echo "Cloud Armor policy:     $SECURITY_POLICY"
+echo "Certificate map:        $CERT_MAP_NAME"
 echo "ArgoCD URL:             $ARGOCD_URL"
 
 # --- Step 3: ArgoCD admin credentials + Gateway IP ---------------------------
@@ -172,17 +174,23 @@ echo "  $ARGOCD_GATEWAY_IP  $ARGOCD_HOSTNAME"
 
 section "Step 4: Update helm/api-service/values-prod.yaml with real values"
 
-confirm "Edits $VALUES_FILE in place, replacing placeholder tokens
-(REPLACE_WITH_*, api.REPLACE_WITH_DOMAIN.com) with the real values fetched
-above. Only touches these known placeholder strings - nothing else in the
-file changes. Review the diff printed after this step before committing."
+confirm "Edits $VALUES_FILE in place, setting gateway.hostname,
+gateway.certificateMapName, cloudArmor.securityPolicyName,
+serviceAccount.gcpServiceAccountEmail, database.host, and
+externalSecrets.gcpProjectId to the real values fetched above - by YAML
+key, not by matching leftover placeholder text, so this stays correct
+even on a re-run after the underlying infra changed (e.g. Cloud SQL's
+private IP is reassigned after a destroy+recreate). Only touches these
+six keys' values - nothing else in the file changes. Review the diff
+printed after this step before committing."
 
-sed -i.bak \
-  -e "s|api\.REPLACE_WITH_DOMAIN\.com|${APP_HOSTNAME}|" \
-  -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_security_policy_name|${SECURITY_POLICY}|" \
-  -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_app_service_account_email|${APP_SA_EMAIL}|" \
-  -e "s|REPLACE_WITH_TERRAFORM_OUTPUT_database_private_ip|${DB_HOST}|" \
-  -e "s|REPLACE_WITH_GCP_PROJECT_ID|${PROJECT_ID}|" \
+sed -i.bak -E \
+  -e "s|^([[:space:]]*hostname: ).*|\1\"${APP_HOSTNAME}\"|" \
+  -e "s|^([[:space:]]*certificateMapName: ).*|\1\"${CERT_MAP_NAME}\"|" \
+  -e "s|^([[:space:]]*securityPolicyName: ).*|\1\"${SECURITY_POLICY}\"|" \
+  -e "s|^([[:space:]]*gcpServiceAccountEmail: ).*|\1\"${APP_SA_EMAIL}\"|" \
+  -e "s|^([[:space:]]*host: ).*|\1\"${DB_HOST}\"|" \
+  -e "s|^([[:space:]]*gcpProjectId: ).*|\1\"${PROJECT_ID}\"|" \
   "$VALUES_FILE"
 rm -f "$VALUES_FILE.bak"
 

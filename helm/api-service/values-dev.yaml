@@ -35,7 +35,7 @@ serviceAccount:
   gcpServiceAccountEmail: "tenant-dev-app-sa@knotch-dev.iam.gserviceaccount.com"
 
 database:
-  host: "172.26.0.3"
+  host: "172.26.0.5"
   name: appdb
   user: appuser
 

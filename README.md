@@ -568,6 +568,20 @@ export GITHUB_REPO="REPLACE_REPO"
 export PROJECT_ID="your-dev-or-prod-gcp-project-id"   # e.g. $DEV_PROJECT_ID, then $PROD_PROJECT_ID
 export ENV_NAME="dev"                                  # or "prod"
 
+# The IAM Credentials API is what CI's WIF-based auth actually calls to
+# exchange GitHub's OIDC token for short-lived credentials as the CI
+# service account (google-github-actions/auth, and the GCS backend's own
+# auth during `terraform init`, both depend on it). It's disabled by
+# default on a brand-new project and Terraform can't bootstrap it for you
+# here: enabling it is itself a `google_project_service` resource inside
+# the Terraform this very CI identity is meant to run - so until this one
+# API is on, that identity can't authenticate at all, let alone apply
+# anything. This is the one API that has to be enabled out-of-band, before
+# CI's first ever run against a project - not a workaround, an inherent
+# bootstrapping requirement of keyless WIF auth on a project that has
+# never been touched by Terraform yet.
+gcloud services enable iamcredentials.googleapis.com --project="$PROJECT_ID"
+
 # Workload Identity Federation pool + provider, trusting GitHub Actions'
 # OIDC tokens - this is what makes CI's GCP auth keyless. A separate pool
 # per project, since pools are project-scoped resources.

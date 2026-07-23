@@ -22,6 +22,10 @@ locals {
     "certificatemanager.googleapis.com",
     "iamcredentials.googleapis.com",
     "dns.googleapis.com",
+    # Needed by module.workload_identity's google_project_iam_member (grants
+    # the app SA project-level roles/cloudsql.client) - that resource type
+    # reads/writes project IAM policy through this API, not IAM's own API.
+    "cloudresourcemanager.googleapis.com",
   ]
 }
 
@@ -137,6 +141,8 @@ module "workload_identity" {
     module.database.db_password_secret_id,
     google_secret_manager_secret.third_party_api_key.secret_id,
   ]
+
+  depends_on = [time_sleep.wait_for_apis]
 }
 
 module "certificate" {

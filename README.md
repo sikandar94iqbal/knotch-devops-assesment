@@ -184,6 +184,17 @@ demo/assessment), first-class App-of-Apps pattern, and per-Application
 
 ---
 
+## Using this repo
+
+1. **Clone it**: `git clone <this-repo-url>`.
+2. **Update the placeholders** before your first `apply` - project IDs, state bucket names, hostnames, org/repo. Full list: [Placeholders to replace before pushing](#placeholders-to-replace-before-pushing).
+3. **Deploy dev/prod**: follow [Bootstrap: from zero to running](#bootstrap-from-zero-to-running) below.
+4. **Adding a third environment** (e.g. staging): see [Adding a new environment](#adding-a-new-environment) - copy dev/prod's pattern, don't write new modules.
+
+That's the whole entry point - everything else in this README is reference detail for those four steps.
+
+---
+
 ## Bootstrap: from zero to running
 
 1. **GCP project + billing** exist (manual, unavoidable - see above).

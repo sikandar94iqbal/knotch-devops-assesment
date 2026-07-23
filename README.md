@@ -604,10 +604,14 @@ gcloud storage buckets add-iam-policy-binding "gs://your-org-tenant-${ENV_NAME}-
   --role="roles/storage.objectAdmin"
 
 # Let GitHub's OIDC token impersonate this project's CI service account.
+# Pools are addressed by project NUMBER here, not project ID - resolve it first.
+export PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+
 gcloud iam service-accounts add-iam-policy-binding \
   "tenant-platform-ci-${ENV_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
   --role="roles/iam.workloadIdentityUser" \
-  --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/attribute.repository/${GITHUB_ORG}/${GITHUB_REPO}"
+  --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github-pool/attribute.repository/${GITHUB_ORG}/${GITHUB_REPO}"
+# --- end repeat block ---
 ```
 
 Then, in the GitHub repo (Settings -> Secrets and variables -> Actions ->

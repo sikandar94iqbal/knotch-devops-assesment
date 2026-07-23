@@ -3,7 +3,7 @@
 # email) are filled in from `terraform output` after `terraform apply` in
 # terraform/environments/dev - see the README bootstrap section.
 
-replicaCount: 2
+replicaCount: 5
 
 autoscaling:
   minReplicas: 2

@@ -123,6 +123,13 @@ resource "google_secret_manager_secret" "third_party_api_key" {
   }
 
   depends_on = [time_sleep.wait_for_apis]
+
+  # Prod-only guard: deleting this secret loses the third-party credential
+  # with no recovery path. teardown-prod.sh flips this to false (alongside
+  # the deletion_protection flags below) before a real teardown.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 module "workload_identity" {

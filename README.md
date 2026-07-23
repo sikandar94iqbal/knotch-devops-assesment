@@ -192,7 +192,7 @@ ArgoCD's own Application tree for `knotch-demo-app-dev` - `Synced`/`Healthy`, ev
 
 ![ArgoCD Application tree, Synced and Healthy](docs/screenshots/argocd-sync-tree.png)
 
-Real `terraform plan` output from CI, posted as a PR comment: [plan-dev, PR #3](https://github.com/sikandar94iqbal/knotch-devops-assesment/pull/1#issuecomment-5059058641).
+Real `terraform plan` output from CI, posted as a PR comment: [plan-prod, PR #1](https://github.com/sikandar94iqbal/knotch-devops-assesment/pull/1#issuecomment-5059058641).
 
 ---
 

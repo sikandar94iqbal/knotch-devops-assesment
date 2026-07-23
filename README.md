@@ -182,6 +182,18 @@ demo/assessment), first-class App-of-Apps pattern, and per-Application
 | App | ✅ 2 Pods `Running` | ✅ 3 Pods `Running` |
 | DB connectivity verified | ✅ `scripts/test-db-connection.sh dev` | ✅ `scripts/test-db-connection.sh prod` |
 
+### Evidence
+
+`kubectl get pods`/`get all` against the live `tenant-dev` namespace - Deployment, ReplicaSet, HPA, and both Pods `Running`:
+
+![kubectl get pods/all in tenant-dev](docs/screenshots/dev-pods-and-resources.png)
+
+ArgoCD's own Application tree for `knotch-demo-app-dev` - `Synced`/`Healthy`, every child resource (Secret, Service, ServiceAccount, Deployment, HPA, ExternalSecret, SecretStore, Gateway) green:
+
+![ArgoCD Application tree, Synced and Healthy](docs/screenshots/argocd-sync-tree.png)
+
+Real `terraform plan` output from CI, posted as a PR comment: [plan-dev, PR #3](https://github.com/sikandar94iqbal/knotch-devops-assesment/pull/3#issuecomment-5062775665).
+
 ---
 
 ## Using this repo

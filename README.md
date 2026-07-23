@@ -577,6 +577,19 @@ architecture decisions recorded in `CLAUDE.md`.
   (diagnosed via browser DevTools + `curl` + Cloud Armor logs) - rulesets
   removed, root cause and correct fix documented in
   [Cloud Armor](#cloud-armor) above.
+- **Bug the repo owner discovered, not the assistant**: after rebuilding
+  dev from scratch, the owner noticed Cloud SQL's private IP had changed
+  but `values-dev.yaml` still had the old one after re-running the
+  bootstrap workflow. Root cause: the Helm values fill-in only replaced
+  leftover `REPLACE_WITH_*` placeholder text, so once a field was filled
+  in once, later runs silently no-op'd for it - even after the real
+  infrastructure changed. The assistant diagnosed and fixed this
+  (switched to matching by YAML key instead of placeholder text, in
+  `setup-dev.sh`, `setup-prod.sh`, and `bootstrap-environment.yaml`), then
+  the owner asked for a second pass to confirm every placeholder in
+  `values.yaml` was actually covered - one more gap turned up
+  (`externalSecrets.clusterName` was never wired up at all, in either the
+  old or new logic) and was fixed the same way.
 - **Validated locally**: `terraform fmt`/`validate` clean across all
   three stacks; `helm lint`/`helm template` clean for both value files;
   `scripts/test-db-connection.sh` run and passing against both live

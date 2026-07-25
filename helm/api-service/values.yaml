@@ -51,6 +51,12 @@ probes:
     failureThreshold: 3
 
 autoscaling:
+  # Set to false (alongside replicaCount: 0) to scale an environment to
+  # zero Pods - HPA doesn't accept minReplicas: 0 for plain CPU/memory
+  # Resource metrics like these, so pausing it entirely (not just lowering
+  # minReplicas) is the only way to actually reach zero without the HPA
+  # immediately scaling back up on its next reconcile.
+  enabled: true
   minReplicas: 2
   maxReplicas: 4
   targetCPUUtilizationPercentage: 70

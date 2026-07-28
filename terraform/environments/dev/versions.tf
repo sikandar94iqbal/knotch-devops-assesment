@@ -37,7 +37,7 @@ terraform {
   # project and their own state bucket, not a shared one. That's a
   # deliberate isolation choice: nothing about dev's state, IAM, or quota
   # can affect prod, or vice versa.
-  #
+  # 
   # REPLACE_WITH_DEV_TF_STATE_BUCKET: from `terraform output bucket_name`
   # after bootstrapping the dev project - see the README bootstrap section.
   # A backend can't be provisioned by the same Terraform run that needs it.

@@ -42,7 +42,7 @@ terraform {
   # after bootstrapping the dev project - see the README bootstrap section.
   # A backend can't be provisioned by the same Terraform run that needs it.
   backend "gcs" {
-    bucket = "knotch-dev-tfstate"
+    bucket = "knotch-dev-env-tfstate"
     prefix = "tenant-platform/dev"
   }
 }

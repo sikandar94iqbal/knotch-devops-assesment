@@ -313,6 +313,14 @@ PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(project
 
 # GKE Autopilot nodes use the default Compute Engine SA - creating the
 # cluster attaches it, which needs serviceAccountUser on that specific SA.
+# That default SA only gets auto-created the first time
+# compute.googleapis.com is enabled in this project - on knotch-dev/
+# knotch-prod this was already true by the time CI was bootstrapped
+# (an earlier terraform apply had enabled it), but on a genuinely
+# brand-new project (nothing applied yet) the binding below fails with
+# "NOT_FOUND: Unknown service account" until you enable it explicitly:
+gcloud services enable compute.googleapis.com --project="$PROJECT_ID"
+
 gcloud iam service-accounts add-iam-policy-binding "${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --project="$PROJECT_ID" --role="roles/iam.serviceAccountUser" \
   --member="serviceAccount:tenant-platform-ci-${ENV_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"

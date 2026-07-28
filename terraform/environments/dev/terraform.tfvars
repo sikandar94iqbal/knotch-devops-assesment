@@ -4,7 +4,7 @@
 # runaway resource or an over-broad role binding here has no way to touch
 # prod, because it's a different project entirely, not just a different
 # VPC/cluster within one shared project.
-project_id = "knotch-dev"
+project_id = "knotch-dev-env"
 region     = "us-central1"
 
 # No real domain registered yet: certificate_mode = "self_signed" makes

@@ -3,12 +3,10 @@
 # email) are filled in from `terraform output` after `terraform apply` in
 # terraform/environments/dev - see the README bootstrap section.
 
-# Scaled to zero (paused, not torn down). To restore: replicaCount back
-# to 2, autoscaling.enabled: true.
-replicaCount: 0
+replicaCount: 2
 
 autoscaling:
-  enabled: false
+  enabled: true
   minReplicas: 2
   maxReplicas: 4
   targetCPUUtilizationPercentage: 70

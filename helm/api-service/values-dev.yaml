@@ -35,15 +35,15 @@ cloudArmor:
   securityPolicyName: "tenant-dev-armor-policy"
 
 serviceAccount:
-  gcpServiceAccountEmail: "tenant-dev-app-sa@knotch-dev.iam.gserviceaccount.com"
+  gcpServiceAccountEmail: "tenant-dev-app-sa@knotch-dev-env.iam.gserviceaccount.com"
 
 database:
-  host: "172.26.0.5"
+  host: "10.51.0.3"
   name: appdb
   user: appuser
 
 externalSecrets:
-  gcpProjectId: "knotch-dev"
+  gcpProjectId: "knotch-dev-env"
   gcpRegion: us-central1
   clusterName: "tenant-dev-gke"
   dbPasswordSecretId: "tenant-dev-db-password"

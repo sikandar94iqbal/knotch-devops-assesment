@@ -2,7 +2,7 @@
 # (terraform/environments/dev/terraform.tfvars). See the same note in
 # dev/terraform.tfvars: separate projects are what actually isolate dev
 # from prod, not just separate name prefixes within one shared project.
-project_id = "knotch-prod"
+project_id = "knotch-prod-env"
 region     = "us-central1"
 
 # No real domain registered yet: certificate_mode = "self_signed" makes

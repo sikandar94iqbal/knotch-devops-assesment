@@ -36,7 +36,7 @@ terraform {
   # REPLACE_WITH_PROD_TF_STATE_BUCKET: from `terraform output bucket_name`
   # after bootstrapping the prod project.
   backend "gcs" {
-    bucket = "knotch-prod-tfstate"
+    bucket = "knotch-prod-env-tfstate"
     prefix = "tenant-platform/prod"
   }
 }

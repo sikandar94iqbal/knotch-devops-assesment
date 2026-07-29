@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: dev
     env:
-      PROJECT_ID: knotch-dev
+      PROJECT_ID: knotch-dev-env
       REGION: us-central1
       CLUSTER_NAME: tenant-dev-gke
       APP_NAME: knotch-demo-app-dev
@@ -205,7 +205,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: prod
     env:
-      PROJECT_ID: knotch-prod
+      PROJECT_ID: knotch-prod-env
       REGION: us-central1
       CLUSTER_NAME: tenant-prod-gke
       APP_NAME: knotch-demo-app-prod

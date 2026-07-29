@@ -22,11 +22,24 @@ locals {
     "certificatemanager.googleapis.com",
     "iamcredentials.googleapis.com",
     "dns.googleapis.com",
-    # Needed by module.workload_identity's google_project_iam_member (grants
-    # the app SA project-level roles/cloudsql.client) - that resource type
-    # reads/writes project IAM policy through this API, not IAM's own API.
-    "cloudresourcemanager.googleapis.com",
   ]
+}
+
+# Enabled on its own, ahead of everything else - enabling ANY API via
+# google_project_service intermittently fails with "Cloud Resource
+# Manager API has not been used in project ... before or it is disabled"
+# on a genuinely brand-new project if this one isn't active yet.
+# for_each members of the same resource have no guaranteed ordering
+# relative to each other, so this can't just be one more entry in
+# local.required_apis below - it has to be a separate resource the rest
+# explicitly depend on. Confirmed live: this exact race hit
+# sqladmin.googleapis.com's own enablement on a from-scratch apply
+# against a fresh project, not just module.workload_identity's IAM
+# resource as originally diagnosed.
+resource "google_project_service" "cloudresourcemanager" {
+  project            = var.project_id
+  service            = "cloudresourcemanager.googleapis.com"
+  disable_on_destroy = false
 }
 
 resource "google_project_service" "apis" {
@@ -35,6 +48,17 @@ resource "google_project_service" "apis" {
   project            = var.project_id
   service            = each.value
   disable_on_destroy = false
+
+  depends_on = [google_project_service.cloudresourcemanager]
+}
+
+# Lets any state that already has this as a for_each member (e.g. a prod
+# environment applied before this fix) move to the new address cleanly,
+# instead of destroying and recreating it (harmless either way, since
+# disable_on_destroy = false, but this avoids a spurious diff).
+moved {
+  from = google_project_service.apis["cloudresourcemanager.googleapis.com"]
+  to   = google_project_service.cloudresourcemanager
 }
 
 # Enabling an API returns success well before Google's backend has finished

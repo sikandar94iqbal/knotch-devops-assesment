@@ -32,15 +32,15 @@ cloudArmor:
   securityPolicyName: "tenant-prod-armor-policy"
 
 serviceAccount:
-  gcpServiceAccountEmail: "tenant-prod-app-sa@knotch-prod.iam.gserviceaccount.com"
+  gcpServiceAccountEmail: "tenant-prod-app-sa@knotch-prod-env.iam.gserviceaccount.com"
 
 database:
-  host: "10.162.0.2"
+  host: "172.25.0.2"
   name: appdb
   user: appuser
 
 externalSecrets:
-  gcpProjectId: "knotch-prod"
+  gcpProjectId: "knotch-prod-env"
   gcpRegion: us-central1
   clusterName: "tenant-prod-gke"
   dbPasswordSecretId: "tenant-prod-db-password"
